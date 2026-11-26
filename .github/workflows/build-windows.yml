@@ -34,8 +34,9 @@ jobs:
           echo "VERSION_NUM=${VERSION_NUM}" >> "$GITHUB_ENV"
           echo "Resolved VERSION_NUM=${VERSION_NUM}"
 
-      - name: Cache xmake dependencies
-        uses: actions/cache@v4
+      - name: Restore xmake dependencies cache
+        id: xmake-cache
+        uses: actions/cache/restore@v4
         with:
           path: D:\xmake_global\.xmake\packages
           key: windows-xmake-deps-cuda-${{ hashFiles('xmake.lua', 'apps/desktop/xmake/**/*.lua', 'deps/submodules/minirtc/xmake.lua') }}
@@ -51,8 +52,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           xmake repo -u
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           xmake create cuda
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Push-Location cuda
           xmake g --theme=plain
           $cudaPath = ""
@@ -68,8 +72,12 @@ jobs:
           if (-not $cudaPath -or -not (Test-Path $cudaPath)) {
             Write-Host "Installing CUDA 12.6.3 package via xmake..."
             xmake require -vy "cuda 12.6.3"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $info = xmake require --info "cuda 12.6.3"
             $cudaPath = (($info | Select-String installdir).ToString() -replace '.*installdir:\s*','').Trim()
+          }
+          if (-not $cudaPath -or -not (Test-Path $cudaPath)) {
+            throw "Failed to resolve CUDA_PATH"
           }
           "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Resolved CUDA_PATH = $cudaPath"
@@ -78,6 +86,7 @@ jobs:
       - name: Setup NSIS plugins
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $ProgressPreference = 'SilentlyContinue'
           $url = "https://github.com/DigitalMediaServer/NSIS-INetC-plugin/releases/download/v1.0.5.7/InetC.zip"
           $out = "$env:RUNNER_TEMP\InetC.zip"
@@ -90,21 +99,42 @@ jobs:
       - name: Build CrossDesk & Run Wire Unit Tests
         shell: pwsh
         run: |
-          xmake f --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true -y
-          xmake b -vy wire_test keyboard_state_wire_test crossdesk
-          xmake r wire_test
+          $ErrorActionPreference = "Stop"
+          xmake f -p windows -a x64 -m release --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true --CROSSDESK_PORTABLE=false -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy crossdesk_wire_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake r crossdesk_wire_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy keyboard_state_wire_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           xmake r keyboard_state_wire_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy crossdesk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Save xmake dependencies cache
+        if: always() && steps.xmake-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\xmake_global\.xmake\packages
+          key: ${{ steps.xmake-cache.outputs.cache-primary-key }}
 
       - name: Package Windows Installer
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           & "${{ github.workspace }}\apps\desktop\scripts\windows\pkg_x64.ps1" $env:VERSION_NUM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build & Package Portable CrossDesk
         shell: pwsh
         run: |
-          xmake f --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true --CROSSDESK_PORTABLE=true -y
+          $ErrorActionPreference = "Stop"
+          xmake f -p windows -a x64 -m release --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true --CROSSDESK_PORTABLE=true -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           xmake b -vy crossdesk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $buildDir = "${{ github.workspace }}\build\windows\x64\release"
           $portableDir = "${{ github.workspace }}\portable"
@@ -116,6 +146,7 @@ jobs:
             @("crossdesk_session_helper.exe", "crossdesk_session_helper.exe"),
             @("crossdesk_privacy_cursor_helper.exe", "crossdesk_privacy_cursor_helper.exe"),
             @("crossdesk_privacy_window.dll", "crossdesk_privacy_window.dll"),
+            @("wgc_plugin.dll", "wgc_plugin.dll"),
             @("slint_cpp.dll", "slint_cpp.dll")
           )
           foreach ($file in $portableFiles) {
