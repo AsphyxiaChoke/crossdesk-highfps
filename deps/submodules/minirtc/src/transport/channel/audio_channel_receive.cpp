@@ -1,0 +1,77 @@
+#include "audio_channel_receive.h"
+
+#include "log.h"
+#include "rtp_packet.h"
+
+namespace minirtc {
+
+AudioChannelReceive::AudioChannelReceive() {}
+
+AudioChannelReceive::AudioChannelReceive(
+    const std::string& channel_name, uint32_t ssrc,
+    std::shared_ptr<SystemClock> clock, std::shared_ptr<IceAgent> ice_agent,
+    std::shared_ptr<IOStatistics> ice_io_statistics,
+    std::function<void(const char*, size_t, uint16_t, uint32_t)>
+        on_receive_audio)
+    : channel_name_(channel_name),
+      ssrc_(ssrc),
+      clock_(clock),
+      ice_agent_(ice_agent),
+      ice_io_statistics_(ice_io_statistics),
+      on_receive_audio_(on_receive_audio) {}
+
+AudioChannelReceive::~AudioChannelReceive() {}
+
+void AudioChannelReceive::Initialize(rtp::PAYLOAD_TYPE payload_type) {
+  rtp_audio_receiver_ = std::make_unique<RtpAudioReceiver>(
+      ssrc_, clock_, ice_io_statistics_);
+  rtp_audio_receiver_->SetOnReceiveData([this](const char* data, size_t size,
+                                               uint16_t sequence,
+                                               uint32_t timestamp) -> void {
+    if (on_receive_audio_) {
+      on_receive_audio_(data, size, sequence, timestamp);
+    }
+  });
+
+  rtp_audio_receiver_->SetSendDataFunc([this](const char* data,
+                                              size_t size) -> int {
+    if (!ice_agent_) {
+      LOG_ERROR("ice_agent_ is nullptr");
+      return -1;
+    }
+
+    auto ice_state = ice_agent_->GetIceState();
+
+    if (ICE_STATE_NULLPTR == ice_state || ICE_STATE_DESTROYED == ice_state) {
+      LOG_ERROR("Ice is not connected, state = [{}]", (int)ice_state);
+      return -2;
+    }
+
+    ice_io_statistics_->UpdateAudioOutboundBytes((uint32_t)size);
+    return ice_agent_->Send(data, size);
+  });
+}
+
+void AudioChannelReceive::Destroy() {}
+
+int AudioChannelReceive::OnReceiveRtpPacket(const char* data, size_t size) {
+  if (ice_io_statistics_) {
+    ice_io_statistics_->UpdateAudioInboundBytes((uint32_t)size);
+  }
+
+  if (rtp_audio_receiver_) {
+    if (size < kFixedHeaderSize) {
+      LOG_ERROR("Received RTP packet is too small, size={}", size);
+      return -1;
+    }
+    RtpPacket rtp_packet;
+    if (!rtp_packet.Build((const uint8_t*)data, (uint32_t)size) ||
+        rtp_packet.Ssrc() != ssrc_ ||
+        rtp_packet.PayloadType() != rtp::PAYLOAD_TYPE::OPUS)
+      return -1;
+    rtp_audio_receiver_->InsertRtpPacket(rtp_packet);
+  }
+
+  return 0;
+}
+}  // namespace minirtc

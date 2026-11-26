@@ -1,0 +1,63 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-01-03
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _AUDIO_CHANNEL_SEND_H_
+#define _AUDIO_CHANNEL_SEND_H_
+
+#include "clock/system_clock.h"
+#include "ice_agent.h"
+#include "media_channel.h"
+#include "paced_sender.h"
+#include "rtp_audio_sender.h"
+#include "rtp_packetizer.h"
+#include "rtp_timestamp.h"
+
+namespace minirtc {
+
+class AudioChannelSend : public MediaChannel {
+ public:
+  AudioChannelSend();
+  AudioChannelSend(const std::string& channel_name,
+                   std::shared_ptr<SystemClock> clock,
+                   std::shared_ptr<IceAgent> ice_agent,
+                   std::shared_ptr<IOStatistics> ice_io_statistics);
+  virtual ~AudioChannelSend();
+
+ public:
+  void Initialize(rtp::PAYLOAD_TYPE payload_type,
+                  std::shared_ptr<PacedSender> packet_sender) override;
+  void Destroy() override;
+  void SetSendPaused(bool paused) override;
+
+  void SetAbsoluteSendTimeExtensionId(
+      std::optional<uint8_t> extension_id) override;
+
+  uint32_t GetSsrc() override {
+    if (rtp_audio_sender_) {
+      return rtp_audio_sender_->GetSsrc();
+    }
+    return 0;
+  }
+
+  int SendAudio(char* data, size_t size,
+                uint32_t samples_per_channel,
+                int64_t captured_timestamp_us) override;
+
+  void OnReceiverReport(const ReceiverReport& receiver_report) override {}
+
+ private:
+  std::string channel_name_;
+  std::shared_ptr<PacedSender> paced_sender_ = nullptr;
+  std::shared_ptr<IceAgent> ice_agent_ = nullptr;
+  std::shared_ptr<IOStatistics> ice_io_statistics_ = nullptr;
+  std::unique_ptr<RtpPacketizer> rtp_packetizer_ = nullptr;
+  std::unique_ptr<RtpAudioSender> rtp_audio_sender_ = nullptr;
+  std::optional<uint8_t> abs_send_time_ext_id_;
+  RtpSampleTimestampGenerator rtp_timestamp_generator_;
+};
+}  // namespace minirtc
+
+#endif

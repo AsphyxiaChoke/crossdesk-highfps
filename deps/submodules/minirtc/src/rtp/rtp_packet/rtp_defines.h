@@ -1,0 +1,59 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-01-23
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _RTP_DEFINES_H_
+#define _RTP_DEFINES_H_
+
+#include <cstddef>
+#include <cstdint>
+
+#define DEFAULT_MTU 1500
+#define MAX_NALU_LEN 1150
+
+namespace minirtc {
+namespace rtp {
+
+typedef enum {
+  UNDEFINED = 0,
+  H264 = 96,
+  H264_FEC_SOURCE = 97,
+  H264_FEC_REPAIR = 98,
+  AV1 = 99,
+  H265 = 101,  // 100 is reserved for H.265 padding probes.
+  H265_RTX = 126,
+  OPUS = 111,
+  RS_FEC = 122,
+  RTX = 127,
+  DATA = 120,
+  KCP = 121
+} PAYLOAD_TYPE;
+
+inline PAYLOAD_TYPE VideoRtxPayloadType(int media_pt) {
+  return media_pt == H265 ? H265_RTX : RTX;
+}
+
+typedef struct {
+  uint8_t forbidden_bit : 1;
+  uint8_t nal_reference_idc : 2;
+  uint8_t nal_unit_type : 5;
+} FU_INDICATOR;
+
+typedef struct {
+  uint8_t start : 1;
+  uint8_t end : 1;
+  uint8_t remain_bit : 1;
+  uint8_t nal_unit_type : 5;
+} FU_HEADER;
+
+typedef enum { UNKNOWN = 0, NALU = 1, FU_A = 28, FU_B = 29 } NAL_UNIT_TYPE;
+
+const int kVideoPayloadTypeFrequency = 90000;
+const int kAudioPayloadTypeFrequency = 48000;
+
+static int kMsToRtpTimestamp = 90;
+}  // namespace rtp
+}  // namespace minirtc
+#endif

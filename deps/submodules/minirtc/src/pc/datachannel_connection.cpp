@@ -1,0 +1,775 @@
+#include "datachannel_connection.h"
+
+#include <utility>
+#include <variant>
+
+#include "common.h"
+#include "ice_server_resolver.h"
+#include "ice_utils.h"
+#include "log.h"
+#include "nlohmann/json.hpp"
+#include "web_input_router.h"
+
+namespace minirtc {
+
+using nlohmann::json;
+
+template <class T>
+std::weak_ptr<T> make_weak_ptr(std::shared_ptr<T> ptr) {
+  return ptr;
+}
+
+DataChannelConnection::DataChannelConnection(
+    std::shared_ptr<SystemClock> clock, std::shared_ptr<SignalSender> ws,
+    const ConnectionInfo& info, const MediaStreamIds& media_stream_ids,
+    const ConnectionCallbacks& callbacks)
+    : clock_(clock),
+      ws_(ws),
+      info_(info),
+      media_stream_ids_(media_stream_ids),
+      callbacks_(callbacks) {
+  // disable av1 encoding
+  info_.video_codec = MiniRtcVideoCodec::H264;
+  InitLogger(SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG ? ::rtc::LogLevel::Debug
+                                                    : ::rtc::LogLevel::Info,
+             [](::rtc::LogLevel level, std::string message) {
+               switch (level) {
+                 case ::rtc::LogLevel::Verbose:
+                   LOG_TRACE("{}", message);
+                   break;
+                 case ::rtc::LogLevel::Debug:
+                   LOG_DEBUG("{}", message);
+                   break;
+                 case ::rtc::LogLevel::Info:
+                   LOG_INFO("{}", message);
+                   break;
+                 case ::rtc::LogLevel::Warning:
+                   LOG_WARN("{}", message);
+                   break;
+                 case ::rtc::LogLevel::Error:
+                   LOG_ERROR("{}", message);
+                   break;
+                 case ::rtc::LogLevel::Fatal:
+                   LOG_FATAL("{}", message);
+                   break;
+                 case ::rtc::LogLevel::None:
+                   break;
+                 default:
+                   break;
+               }
+             });
+}
+
+DataChannelConnection::~DataChannelConnection() { ResetDataChannelTransport(); }
+
+int DataChannelConnection::Init() {
+  if (!ConnectionIceConfigFresh(info_)) return -1;
+  peer_connection_config_.iceServers.clear();
+  for (const auto& server : info_.ice_config->servers) {
+    if (!server.turn) {
+      peer_connection_config_.iceServers.emplace_back(server.host, server.port);
+    }
+  }
+  if (info_.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceUdp ||
+      info_.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceTcp) {
+    peer_connection_config_.iceTransportPolicy = ::rtc::TransportPolicy::Relay;
+  }
+  // use trickle ice by default
+  // Offer TCP host candidates as a direct fallback when UDP is blocked.
+  // Relay-only sessions still obey iceTransportPolicy above.
+  peer_connection_config_.enableIceTcp = true;
+  peer_connection_config_.disableAutoNegotiation = true;
+  peer_connection_config_.disableAutoGathering = true;
+
+  return 0;
+}
+
+int DataChannelConnection::ReleaseAllIceTransmission() {
+  ResetDataChannelTransport();
+  return 0;
+}
+
+int DataChannelConnection::SendVideoFrame(const MiniRtcVideoFrame* video_frame,
+                                          const char* stream_id) {
+  if (!dc_ready_) {
+    return -1;
+  }
+
+  if (!dc_transport_) {
+    return -1;
+  }
+
+  dc_transport_->SendVideoFrame(video_frame, stream_id);
+  return 0;
+}
+
+int DataChannelConnection::RequestVideoKeyFrame(const char* stream_id) {
+  if (!dc_ready_ || !dc_transport_) {
+    return -1;
+  }
+
+  dc_transport_->RequestVideoKeyFrame(stream_id ? stream_id : "");
+  return 0;
+}
+
+int DataChannelConnection::RequestAllVideoKeyFrames() {
+  if (!dc_ready_ || !dc_transport_) {
+    return -1;
+  }
+
+  dc_transport_->RequestAllVideoKeyFrames();
+  return 0;
+}
+
+int DataChannelConnection::SendAudioFrame(const MiniRtcAudioFrame* audio_frame,
+                                          const char* stream_id) {
+  if (!dc_ready_) {
+    return -1;
+  }
+
+  if (!dc_transport_) {
+    return -1;
+  }
+
+  return dc_transport_->SendAudioFrame(audio_frame,
+                                       stream_id ? stream_id : "");
+}
+
+int DataChannelConnection::UpdateVideoSettings(
+    MiniRtcVideoQuality quality, int frame_rate,
+    MiniRtcVideoDegradationPreference preference) {
+  return dc_ready_ && dc_transport_
+             ? dc_transport_->UpdateVideoSettings(quality, frame_rate, preference)
+             : -1;
+}
+
+int DataChannelConnection::SendDataFrame(const char* data, size_t size,
+                                         const char* stream_id) {
+  if (!dc_ready_) {
+    return -1;
+  }
+
+  if (!dc_transport_) {
+    return -1;
+  }
+
+  return dc_transport_->SendDataFrame(data, size, stream_id);
+}
+
+int DataChannelConnection::SendReliableDataFrame(const char* data, size_t size,
+                                                 const char* stream_id) {
+  return SendDataFrame(data, size, stream_id);
+}
+
+void DataChannelConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
+  if ((!info_.transmission_id.empty() && !msg.transmission_id.empty() &&
+       msg.transmission_id != info_.transmission_id) ||
+      (!info_.remote_user_id.empty() &&
+       msg.remote_user_id != info_.remote_user_id)) {
+    LOG_WARN("Ignoring DataChannel ICE message for another connection");
+    return;
+  }
+  if ((msg.type == IceWorkMsg::Type::UserJoinTransmission ||
+       msg.type == IceWorkMsg::Type::Offer ||
+       msg.type == IceWorkMsg::Type::RetryWithTurn) &&
+      !ConnectionIceConfigFresh(info_)) {
+    LOG_WARN("ICE credentials expired before data connection creation");
+    callbacks_.on_connection_status(
+        MiniRtcConnectionStatus::MiniRtcConnectionFailed, info_.remote_user_id.data(),
+        info_.remote_user_id.size(), callbacks_.user_data);
+    return;
+  }
+  switch (msg.type) {
+    case IceWorkMsg::Type::Login: {
+      break;
+    }
+    case IceWorkMsg::Type::RetryWithTurn:
+    case IceWorkMsg::Type::UserJoinTransmission: {
+      std::string remote_user_id = msg.remote_user_id;
+      LOG_INFO("Remote user joined transmission");
+      LOG_INFO("Create remote transmission");
+      auto early_candidates = std::move(pending_ice_candidates_);
+      ResetDataChannelTransport();
+      pending_ice_candidates_ = std::move(early_candidates);
+      dc_transport_ = CreateDataChannelConnection(
+          peer_connection_config_, clock_, make_weak_ptr(ws_), true,
+          msg.transmission_id, remote_user_id);
+
+      break;
+    }
+    case IceWorkMsg::Type::UserLeaveTransmission: {
+      std::string remote_user_id = msg.remote_user_id;
+      LOG_INFO("Remote user left transmission");
+
+      LOG_INFO("Terminate remote transmission");
+
+      break;
+    }
+    case IceWorkMsg::Type::Offer: {
+      std::string transmission_id = msg.transmission_id;
+      std::string remote_user_id = msg.remote_user_id;
+
+      LOG_INFO("Received remote offer");
+
+      auto early_candidates = std::move(pending_ice_candidates_);
+      ResetDataChannelTransport();
+      pending_ice_candidates_ = std::move(early_candidates);
+      dc_transport_ = CreateDataChannelConnection(
+          peer_connection_config_, clock_, make_weak_ptr(ws_), false,
+          transmission_id, remote_user_id);
+      if (!dc_transport_) break;
+
+      ::rtc::Description remote_sdp(msg.remote_sdp,
+                                    ::rtc::Description::Type::Offer);
+      // LOG_INFO("Set remote description: {}", msg.remote_sdp.c_str());
+
+      auto& pc = dc_transport_->GetPeerConnection();
+      pc->onDataChannel([weak = make_weak_ptr(dc_transport_)](
+                            std::shared_ptr<::rtc::DataChannel> dc) {
+        auto transport = weak.lock();
+        if (!transport) return;
+        const auto label = dc->label();
+        LOG_INFO("Got a DataChannel with label: {}", label);
+        dc->onClosed([label]() { LOG_INFO("DataChannel closed: {}", label); });
+        dc->onMessage([](auto data) {
+          if (std::holds_alternative<std::string>(data)) {
+            LOG_DEBUG("Received text message: {} bytes",
+                      std::get<std::string>(data).size());
+          }
+        });
+        // Keep the incoming channel alive with this transport, not a local
+        // variable captured by reference after ProcessIceWorkMsg returns.
+        transport->AddDataStream(label, dc);
+      });
+      pc->setRemoteDescription(remote_sdp);
+      FlushRemoteIceCandidates();
+
+      pc->setLocalDescription();
+
+      // send answer
+      std::string answer = pc->localDescription().value().generateSdp();
+
+      json message = {{"type", "answer"},
+                      {"transmission_id", transmission_id},
+                      {"user_id", info_.user_id},
+                      {"remote_user_id", remote_user_id},
+                      {"sdp", answer.c_str()}};
+
+      ws_->Send(message.dump());
+      // LOG_INFO("[{}] send answer to [{}]: {}", info_.user_id,
+      // remote_user_id,
+      //          message.dump());
+
+      pc->gatherLocalCandidates();
+
+      break;
+    }
+    case IceWorkMsg::Type::Answer: {
+      if (!dc_transport_) break;
+      if (!msg.transmission_id.empty() &&
+          msg.transmission_id != active_transmission_id_) break;
+      std::string remote_user_id = msg.remote_user_id;
+      ::rtc::Description remote_sdp(msg.remote_sdp, "answer");
+
+      auto& pc = dc_transport_->GetPeerConnection();
+      if (pc) {
+        // LOG_INFO("Set remote description: {}", msg.remote_sdp.c_str());
+        pc->setRemoteDescription(remote_sdp);
+        FlushRemoteIceCandidates();
+
+        // New hosts gather immediately after the offer. Keep this fallback for
+        // transports whose gathering has not started yet.
+        if (pc->gatheringState() == ::rtc::PeerConnection::GatheringState::New) {
+          pc->gatherLocalCandidates();
+        }
+      }
+
+      break;
+    }
+    case IceWorkMsg::Type::NewCandidate:
+    case IceWorkMsg::Type::NewCandidateMid: {
+      ApplyRemoteIceCandidate(msg);
+      break;
+    }
+    default: {
+      break;
+    }
+  }
+}
+
+void DataChannelConnection::ApplyRemoteIceCandidate(const IceWorkMsg& msg) {
+  const auto signal = ParseIceCandidateSignal(
+      msg.type == IceWorkMsg::Type::NewCandidateMid ? msg.candidate
+                                                   : msg.new_candidate,
+      msg.candidate_ufrag);
+  if (!signal) {
+    LOG_WARN("Reject malformed DataChannel ICE candidate");
+    return;
+  }
+  // libdatachannel 0.24 has no incremental remote-gathering completion API.
+  // Never pass an end marker to Candidate(), which throws for non-candidates.
+  if (signal->complete()) return;
+  if (!active_transmission_id_.empty() && !msg.transmission_id.empty() &&
+      msg.transmission_id != active_transmission_id_) return;
+  auto pc = dc_transport_ ? dc_transport_->GetPeerConnection() : nullptr;
+  const auto remote_description = pc ? pc->remoteDescription() : std::nullopt;
+  if (!remote_description) {
+    const std::string mid =
+        msg.type == IceWorkMsg::Type::NewCandidateMid ? msg.mid : "";
+    for (const auto& pending : pending_ice_candidates_) {
+      const auto& candidate = pending.type == IceWorkMsg::Type::NewCandidateMid
+                                  ? pending.candidate : pending.new_candidate;
+      if (candidate == signal->sdp && pending.candidate_ufrag == signal->ufrag &&
+          pending.mid == mid && pending.transmission_id == msg.transmission_id)
+        return;
+    }
+    if (pending_ice_candidates_.size() < 256) {
+      auto pending = msg;
+      if (msg.type == IceWorkMsg::Type::NewCandidateMid) {
+        pending.candidate = signal->sdp;
+      } else {
+        pending.new_candidate = signal->sdp;
+      }
+      pending.candidate_ufrag = signal->ufrag;
+      pending.mid = mid;
+      pending_ice_candidates_.push_back(std::move(pending));
+    } else {
+      LOG_WARN("DataChannel ICE candidate queue limit reached");
+    }
+    return;
+  }
+  const auto remote_ufrag = remote_description->iceUfrag().value_or("");
+  if (!signal->ufrag.empty() && signal->ufrag != remote_ufrag) return;
+  try {
+    if (msg.type == IceWorkMsg::Type::NewCandidateMid) {
+      pc->addRemoteCandidate(::rtc::Candidate(signal->sdp, msg.mid));
+    } else {
+      pc->addRemoteCandidate(::rtc::Candidate(signal->sdp));
+    }
+  } catch (const std::exception&) {
+    LOG_WARN("Could not add DataChannel ICE candidate");
+  }
+}
+
+void DataChannelConnection::FlushRemoteIceCandidates() {
+  auto pending = std::move(pending_ice_candidates_);
+  pending_ice_candidates_.clear();
+  for (const auto& msg : pending) ApplyRemoteIceCandidate(msg);
+}
+
+void DataChannelConnection::ResetDataChannelTransport() {
+  pending_ice_candidates_.clear();
+  active_transmission_id_.clear();
+  auto transport = std::move(dc_transport_);
+  dc_ready_ = false;
+
+  if (!transport) {
+    return;
+  }
+
+  transport->Shutdown();
+
+  auto pc = transport->GetPeerConnection();
+  if (pc) {
+    pc->close();
+  }
+}
+
+//
+std::shared_ptr<DataChannelTransport>
+DataChannelConnection::CreateDataChannelConnection(
+    const ::rtc::Configuration& config, std::shared_ptr<SystemClock> clock,
+    std::weak_ptr<SignalSender> wws, bool offer_peer,
+    std::string transmission_id, std::string remote_user_id) {
+  offer_peer_ = offer_peer;
+  active_transmission_id_ = transmission_id;
+  auto resolved_config = config;
+  const auto relays =
+      ResolveTurnServerEndpoints(*info_.ice_config, info_.turn_mode);
+  const bool forced = info_.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceUdp ||
+                      info_.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceTcp;
+  if (!ConnectionIceConfigFresh(info_) || (forced && relays.empty())) {
+    callbacks_.on_connection_status(
+        MiniRtcConnectionStatus::MiniRtcConnectionFailed, remote_user_id.data(), remote_user_id.size(),
+        callbacks_.user_data);
+    return nullptr;
+  }
+  for (const auto& server : relays) {
+    resolved_config.iceServers.emplace_back(
+        server.host, server.port, server.username, server.password,
+        server.tcp ? ::rtc::IceServer::RelayType::TurnTcp
+                   : ::rtc::IceServer::RelayType::TurnUdp);
+  }
+  auto peer_connection =
+      std::make_shared<::rtc::PeerConnection>(resolved_config);
+  auto dc_transport = std::make_shared<DataChannelTransport>(
+      clock, peer_connection, info_.user_id, remote_user_id, offer_peer_,
+      callbacks_.on_selected_route);
+  peer_connection->onIceStateChange(
+      [weak = make_weak_ptr(dc_transport)](::rtc::PeerConnection::IceState state) {
+        if (state != ::rtc::PeerConnection::IceState::Connected &&
+            state != ::rtc::PeerConnection::IceState::Completed) return;
+        if (auto transport = weak.lock()) transport->ReportSelectedRoute();
+      });
+  dc_transport->SetVideoConfig(
+      info_.video_quality, info_.video_frame_rate, info_.video_content_type,
+      info_.video_degradation_preference, info_.desktop_realtime_rate_control);
+
+  peer_connection->onLocalDescription([this, transmission_id, remote_user_id,
+                                       wws](::rtc::Description description) {
+    // std::string local_sdp = std::string(description);
+    // if (offer_peer_ && description.type() ==
+    // ::rtc::Description::Type::Offer)
+    // {
+    //   json message = {{"type", "offer"},
+    //                   {"transmission_id", transmission_id},
+    //                   {"user_id", info_.user_id},
+    //                   {"remote_user_id", remote_user_id},
+    //                   {"sdp", local_sdp.c_str()}};
+
+    //   // Gathering complete, send offer
+    //   if (auto ws = wws.lock()) {
+    //     ws->Send(message.dump());
+    //     // LOG_INFO("[{}] send offer to [{}]: {}", info_.user_id,
+    //     remote_user_id,
+    //     //          message.dump());
+    //   }
+    // } else if (!offer_peer_ &&
+    //            description.type() ==
+    //            ::rtc::Description::Type::Answer) {
+    //   json message = {{"type", "answer"},
+    //                   {"transmission_id", transmission_id},
+    //                   {"user_id", info_.user_id},
+    //                   {"remote_user_id", remote_user_id},
+    //                   {"sdp", local_sdp.c_str()}};
+
+    //   // Gathering complete, send answer
+    //   if (auto ws = wws.lock()) {
+    //     ws->Send(message.dump());
+    //     // LOG_INFO("[{}] send answer to [{}]: {}", info_.user_id,
+    //     remote_user_id,
+    //     //          message.dump());
+    //   }
+    // }
+  });
+
+  peer_connection->onLocalCandidate(
+      [this, transmission_id, remote_user_id, wws,
+       wpc = make_weak_ptr(peer_connection)](::rtc::Candidate candidate) {
+        json message = {{"type", "new_candidate_mid"},
+                        {"transmission_id", transmission_id},
+                        {"user_id", info_.user_id},
+                        {"remote_user_id", remote_user_id},
+                        {"candidate", candidate.candidate()},
+                        {"mid", candidate.mid()}};
+
+        if (auto pc = wpc.lock()) {
+          if (auto description = pc->localDescription()) {
+            message["ufrag"] = description->iceUfrag().value_or("");
+          }
+        }
+
+        if (auto ws = wws.lock()) {
+          // LOG_INFO("[{}] send new candidate to [{}]: {}", info_.user_id,
+          //          remote_user_id, message.dump());
+          ws->Send(message.dump());
+        }
+      });
+
+  peer_connection->onStateChange(
+      [this, remote_user_id](::rtc::PeerConnection::State state) {
+        MiniRtcConnectionStatus ice_state;
+        switch (state) {
+          case ::rtc::PeerConnection::State::New:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionConnecting;
+            LOG_INFO("PeerConnection state: New");
+            break;
+          case ::rtc::PeerConnection::State::Connecting:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionConnecting;
+            dc_ready_ = false;
+            LOG_INFO("PeerConnection state: Checking");
+            break;
+          case ::rtc::PeerConnection::State::Connected:
+            // Host capabilities are sent by the Connected callback. Wait for
+            // SCTP/DCEP too, otherwise that first reliable message is dropped.
+            if (!dc_transport_ || !dc_transport_->IsControlChannelOpen() ||
+                dc_ready_.exchange(true))
+              return;
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionConnected;
+            LOG_INFO("PeerConnection state: Connected");
+            break;
+          case ::rtc::PeerConnection::State::Disconnected:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionDisconnected;
+            dc_ready_ = false;
+            LOG_INFO("PeerConnection state: Disconnected");
+            break;
+          case ::rtc::PeerConnection::State::Failed:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionFailed;
+            dc_ready_ = false;
+            LOG_ERROR("PeerConnection state: Failed");
+            break;
+          case ::rtc::PeerConnection::State::Closed:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionClosed;
+            dc_ready_ = false;
+            LOG_INFO("PeerConnection state: Closed");
+            break;
+          default:
+            ice_state = MiniRtcConnectionStatus::MiniRtcConnectionFailed;
+            LOG_FATAL("PeerConnection state: Unknown");
+            break;
+        }
+        callbacks_.on_connection_status(ice_state, remote_user_id.data(),
+                                        remote_user_id.size(),
+                                        callbacks_.user_data);
+      });
+
+  peer_connection->onGatheringStateChange(
+      [this, wpc = make_weak_ptr(peer_connection), transmission_id,
+       remote_user_id, wws](::rtc::PeerConnection::GatheringState state) {
+        switch (state) {
+          case ::rtc::PeerConnection::GatheringState::New:
+            LOG_INFO("Gathering state: New");
+            break;
+          case ::rtc::PeerConnection::GatheringState::InProgress:
+            LOG_INFO("Gathering state: InProgress");
+            break;
+          case ::rtc::PeerConnection::GatheringState::Complete:
+            LOG_INFO("Gathering state: Complete");
+            break;
+        }
+      });
+
+  if (offer_peer_) {
+    for (auto& video_stream_id : media_stream_ids_.video) {
+      dc_transport->AddVideoStream(
+          video_stream_id,
+          AddVideo(peer_connection, GenerateUniqueSsrc(), video_stream_id,
+                   video_stream_id, dc_transport->MediaHandler(),
+                   [video_stream_id]() {
+                     LOG_INFO("Video stream {} opened", video_stream_id);
+                   }));
+    }
+
+    for (auto& audio_stream_id : media_stream_ids_.audio) {
+      dc_transport->AddAudioStream(
+          audio_stream_id, AddAudio(peer_connection, rtp::PAYLOAD_TYPE::OPUS,
+                                    GenerateUniqueSsrc(), "audio-stream",
+                                    audio_stream_id, [audio_stream_id]() {
+                                      LOG_INFO("Audio stream {} opened",
+                                               audio_stream_id);
+                                    }));
+    }
+
+    dc_transport->CreateCodecs(clock_, rtp::PAYLOAD_TYPE::H264,
+                               info_.hardware_acceleration);
+
+    // Keep existing control/input aliases interoperable with older browsers.
+    // All other registered streams get their own channel, named by stream_id.
+    auto control = AddData(
+        peer_connection, remote_user_id, callbacks_, make_weak_ptr(dc_transport),
+        [this, remote_user_id, weak = make_weak_ptr(dc_transport)] {
+          auto owner = weak.lock();
+          if (!owner || owner != dc_transport_ ||
+              owner->GetPeerConnection()->state() !=
+                  ::rtc::PeerConnection::State::Connected ||
+              dc_ready_.exchange(true))
+            return;
+          callbacks_.on_connection_status(
+              MiniRtcConnectionStatus::MiniRtcConnectionConnected, remote_user_id.data(),
+              remote_user_id.size(), callbacks_.user_data);
+        });
+    dc_transport->AddDataStream("data-stream", control);
+    for (const auto& [stream_id, reliable] : media_stream_ids_.data) {
+      if (stream_id == "data-stream" || stream_id == "ping-pong" ||
+          stream_id == "data" || stream_id == "mouse" ||
+          stream_id == "keyboard" || stream_id == "control_data") {
+        dc_transport->AddDataStream(stream_id, control);
+        continue;
+      }
+      try {
+        ::rtc::DataChannelInit init;
+        // Preserve the existing file-channel contract for released web clients.
+        const bool legacy_file = stream_id == "file" || stream_id == "file_feedback";
+        if (legacy_file) init.protocol = "crossdesk-file-v1";
+        if (!reliable) {
+          init.reliability.unordered = true;
+          init.reliability.maxRetransmits = 0;
+        }
+        auto channel = peer_connection->createDataChannel(stream_id, init);
+        channel->onMessage([weak = make_weak_ptr(dc_transport), remote_user_id,
+                            callbacks = callbacks_, source = stream_id,
+                            legacy_file](auto data) {
+          auto owner = weak.lock();
+          if (!owner || !callbacks.on_receive_data_buffer) return;
+          if (legacy_file) {
+            if (!std::holds_alternative<::rtc::binary>(data)) return;
+            const auto size = std::get<::rtc::binary>(data).size();
+            // Packed header + uint16 UTF-8 name + at most a 64 KiB chunk.
+            if (source == "file" ? size < 31 || size > 31 + 65535 + 65536
+                                 : size != 28) return;
+          }
+          std::visit([&](const auto& bytes) {
+            callbacks.on_receive_data_buffer(
+                reinterpret_cast<const char*>(bytes.data()), bytes.size(),
+                remote_user_id.data(), remote_user_id.size(), source.data(),
+                source.size(), callbacks.user_data);
+          }, data);
+        });
+        dc_transport->AddDataStream(stream_id, channel);
+      } catch (const std::exception& error) {
+        LOG_WARN("Could not create browser data stream {}: {}", stream_id, error.what());
+      }
+    }
+
+    dc_transport->GetPeerConnection()->setLocalDescription();
+    std::string offer = dc_transport->GetPeerConnection()
+                            ->localDescription()
+                            .value()
+                            .generateSdp();
+    json message = {{"type", "offer"},
+                    {"transmission_id", transmission_id},
+                    {"user_id", info_.user_id},
+                    {"remote_user_id", remote_user_id},
+                    {"sdp", offer.c_str()}};
+
+    if (auto ws = wws.lock()) {
+      ws->Send(message.dump());
+      // LOG_INFO("[{}] send offer to [{}]: {}", info_.user_id, remote_user_id,
+      //          message.dump());
+      // Signal the offer first, then gather in parallel with the browser's
+      // answer. Slow STUN/UPnP discovery must not wait for another signaling RTT.
+      peer_connection->gatherLocalCandidates();
+    }
+  }
+
+  return dc_transport;
+};
+
+std::shared_ptr<Stream> DataChannelConnection::AddVideo(
+    const std::shared_ptr<::rtc::PeerConnection> peer_connection,
+    const uint32_t ssrc, const std::string cname, const std::string msid,
+    const std::shared_ptr<WebMediaHandler>& media_handler,
+    const std::function<void(void)> onOpen) {
+  auto video = ::rtc::Description::Video(cname);
+  // The browser path negotiates H.264 (AV1 is disabled in the constructor).
+  constexpr auto payload_type = rtp::PAYLOAD_TYPE::H264;
+  video.addH264Codec((int)payload_type);
+  video.addExtMap(
+      {3, "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"});
+  video.addSSRC(ssrc, cname, msid, cname);
+  video.setDirection(::rtc::Description::Direction::SendRecv);
+  auto track = peer_connection->addTrack(video);
+  // create RTP configuration
+  auto rtpConfig = std::make_shared<::rtc::RtpPacketizationConfig>(
+      ssrc, cname, payload_type, ::rtc::H264RtpPacketizer::VideoClockRate);
+  // create packetizer
+  auto packetizer = std::make_shared<::rtc::H264RtpPacketizer>(
+      ::rtc::NalUnit::Separator::StartSequence, rtpConfig, 1150);
+  // add RTCP SR handler
+  auto srReporter = std::make_shared<::rtc::RtcpSrReporter>(rtpConfig);
+  media_handler->RegisterStream(ssrc, srReporter);
+  // QoS handles RR/REMB/PLI/FIR and deadline-aware NACK repairs; the
+  // unbounded default NACK responder would bypass its pacing budget.
+  packetizer->addToChain(media_handler);
+  // set handler
+  track->setMediaHandler(packetizer);
+  track->onOpen(onOpen);
+  auto trackData = std::make_shared<Stream>(track, srReporter);
+  return trackData;
+}
+
+std::shared_ptr<Stream> DataChannelConnection::AddAudio(
+    const std::shared_ptr<::rtc::PeerConnection> peer_connection,
+    const rtp::PAYLOAD_TYPE payload_type, const uint32_t ssrc,
+    const std::string cname, const std::string msid,
+    const std::function<void(void)> onOpen) {
+  auto audio = ::rtc::Description::Audio(cname);
+  audio.addOpusCodec((int)payload_type);
+  audio.addSSRC(ssrc, cname, msid, cname);
+  audio.setDirection(::rtc::Description::Direction::SendRecv);
+  auto track = peer_connection->addTrack(audio);
+  // create RTP configuration
+  auto rtpConfig = std::make_shared<::rtc::RtpPacketizationConfig>(
+      ssrc, cname, (int)payload_type,
+      ::rtc::OpusRtpPacketizer::DefaultClockRate);
+  // create packetizer
+  auto packetizer = std::make_shared<::rtc::OpusRtpPacketizer>(rtpConfig);
+  // add RTCP SR handler
+  auto srReporter = std::make_shared<::rtc::RtcpSrReporter>(rtpConfig);
+  packetizer->addToChain(srReporter);
+  // Opus uses in-band FEC; late audio repairs would bypass the QoS budget.
+  // set handler
+  track->setMediaHandler(packetizer);
+  track->onOpen(onOpen);
+  auto trackData = std::make_shared<Stream>(track, srReporter);
+  return trackData;
+}
+
+std::shared_ptr<::rtc::DataChannel> DataChannelConnection::AddData(
+    const std::shared_ptr<::rtc::PeerConnection> peer_connection,
+    const std::string remote_user_id, const ConnectionCallbacks& callbacks,
+    std::weak_ptr<DataChannelTransport> transport,
+    const std::function<void(void)> onOpen) {
+  ::rtc::DataChannelInit control_init;
+  // Advertise support through DCEP metadata, before the browser sends JSON.
+  // Legacy hosts leave this empty, so new browsers can stay silent with them.
+  control_init.protocol = "crossdesk-control-v1";
+  auto dc = peer_connection->createDataChannel("ping-pong", control_init);
+  dc->onOpen(onOpen);
+
+  dc->onClosed([] { LOG_INFO("Web control channel closed"); });
+  auto input = std::make_shared<WebInputRouter>([remote_user_id, callbacks](
+                                                    const std::string& str) {
+    if (!callbacks.on_receive_data_buffer) return;
+    constexpr char source_id[] = "data-stream";
+    callbacks.on_receive_data_buffer(
+        str.data(), str.size(), remote_user_id.data(), remote_user_id.size(),
+        source_id, sizeof(source_id) - 1, callbacks.user_data);
+  });
+  auto upgraded = std::make_shared<std::atomic<bool>>(false);
+  dc->onMessage([transport, input,
+                 upgraded](std::variant<::rtc::binary, std::string> msg) {
+    auto owner = transport.lock();
+    if (!owner || !std::holds_alternative<std::string>(msg)) return;
+    const auto& str = std::get<std::string>(msg);
+    if (str.size() > WebInputRouter::kMaxControlMessageBytes) return;
+    auto message = json::parse(str, nullptr, false);
+    if (!message.is_object()) return;
+    if (message.contains("type") && message["type"] == "web_qos_hello") {
+      if (str.size() > 4096 || !message.contains("version") || message["version"] != 1 ||
+          upgraded->exchange(true))
+        return;
+      try {
+        ::rtc::DataChannelInit motion_init;
+        motion_init.reliability.unordered = true;
+        motion_init.reliability.maxRetransmits = 0;
+        auto motion = owner->GetPeerConnection()->createDataChannel(
+            "crossdesk-input-v1", motion_init);
+        motion->onMessage([input](auto data) {
+          if (std::holds_alternative<std::string>(data))
+            input->Deliver(std::get<std::string>(data), true);
+        });
+        owner->AddDataStream("crossdesk-input-v1", motion);
+        ::rtc::DataChannelInit qos_init;
+        qos_init.reliability.unordered = true;
+        qos_init.reliability.maxPacketLifeTime = std::chrono::milliseconds(500);
+        auto qos = owner->GetPeerConnection()->createDataChannel(
+            "crossdesk-qos-v1", qos_init);
+        qos->onMessage([transport](auto data) {
+          if (auto owner = transport.lock();
+              owner && std::holds_alternative<std::string>(data))
+            owner->ProcessBrowserFeedback(std::get<std::string>(data));
+        });
+        owner->AddDataStream("crossdesk-qos-v1", qos);
+      } catch (const std::exception& error) {
+        LOG_WARN("Could not enable browser QoS channels: {}", error.what());
+      }
+      return;
+    }
+    input->Deliver(str, false, std::move(message));
+  });
+
+  return dc;
+}
+
+}  // namespace minirtc

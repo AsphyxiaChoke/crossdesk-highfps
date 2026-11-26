@@ -1,0 +1,135 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-05-14
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _MEDIA_CHANNEL_H_
+#define _MEDIA_CHANNEL_H_
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include "encoded_frame.h"
+#include "log.h"
+#include "paced_sender.h"
+#include "receiver_report.h"
+#include "sender_report.h"
+
+namespace minirtc {
+
+class MediaChannel {
+ public:
+  MediaChannel() {}
+  virtual ~MediaChannel() {}
+
+ public:
+  virtual void Initialize(rtp::PAYLOAD_TYPE payload_type,
+                          std::shared_ptr<PacedSender> packet_sender) {
+    LOG_INFO("Initialize() default implementation");
+  }
+
+  virtual void Initialize(rtp::PAYLOAD_TYPE payload_type) {
+    LOG_INFO("Initialize() default implementation");
+  }
+
+  // Install before Initialize starts the unpaced audio/data sender threads.
+  void SetSendPacketFunc(std::function<int(const char*, size_t)> send_packet) {
+    send_packet_func_ = std::move(send_packet);
+  }
+
+  // Set once during negotiation, before Initialize / media threads start.
+  virtual void SetFecEnabled(bool enabled) {}
+  // Invoked on the serialized pacer queue after initialization.
+  virtual void SetFecProtection(const FecProtectionConfig& config) {}
+
+  virtual void SetSendPaused(bool paused) {}
+
+  virtual void Destroy() { LOG_INFO("Destroy() default implementation"); }
+
+  virtual void SetAbsoluteSendTimeExtensionId(
+      std::optional<uint8_t> extension_id) {}
+
+  virtual uint32_t GetSsrc() {
+    LOG_INFO("GetSsrc() default implementation");
+    return 0;
+  }
+
+  virtual uint32_t GetRtxSsrc() {
+    LOG_INFO("GetRtxSsrc() default implementation");
+    return 0;
+  }
+
+  virtual int SendVideo(const EncodedFrame& encoded_frame) {
+    LOG_INFO("SendVideo() default implementation");
+    return 0;
+  }
+
+  virtual int SendAudio(char* data, size_t size,
+                        uint32_t samples_per_channel,
+                        int64_t captured_timestamp_us) {
+    LOG_INFO("SendAudio() default implementation");
+    return 0;
+  }
+
+  virtual int SendData(const char* data, size_t size) {
+    LOG_INFO("SendData() default implementation");
+    return 0;
+  }
+
+  virtual int SendReliableData(const char* data, size_t size) {
+    LOG_INFO("SendReliableData() default implementation");
+    return 0;
+  }
+
+  virtual void OnReceiverReport(const ReceiverReport& receiver_report) {
+    LOG_INFO("OnReceiverReport() default implementation");
+  }
+
+  virtual void OnRttUpdate(int64_t rtt_ms) {}
+  virtual void OnClockOffset(int64_t offset_us, int64_t rtt_us) {}
+  virtual void ResetClockOffset() {}
+
+  virtual int OnReceiveRtpPacket(const char* data, size_t size) {
+    LOG_INFO("OnReceiveRtpPacket() default implementation");
+    return 0;
+  }
+
+  virtual void OnSenderReport(const SenderReport& sender_report) {
+    LOG_INFO("OnSenderReport() default implementation");
+  }
+
+  virtual void OnSentRtpPacket(
+      std::unique_ptr<webrtc::RtpPacketToSend> packet) {
+    LOG_INFO("OnSentRtpPacket() default implementation");
+  }
+
+  virtual void OnRtpPacketSendFailed(
+      const webrtc::RtpPacketToSend& packet) {}
+
+  virtual void OnReceiveNack(
+      const std::vector<uint16_t>& nack_sequence_numbers) {
+    LOG_INFO("OnReceiveNack() default implementation");
+  }
+
+  virtual void RequestKeyFrame() {
+    LOG_INFO("RequestKeyFrame() default implementation");
+  }
+
+  virtual std::vector<std::unique_ptr<RtpPacket>> GeneratePadding(
+      uint32_t payload_size, int64_t padding_time_us) {
+    LOG_INFO("GeneratePadding() default implementation");
+    return {};
+  }
+
+  virtual bool CanGeneratePadding() const { return false; }
+
+ protected:
+  std::function<int(const char*, size_t)> send_packet_func_;
+};
+}  // namespace minirtc
+
+#endif

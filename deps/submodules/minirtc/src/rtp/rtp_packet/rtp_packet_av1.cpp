@@ -1,0 +1,23 @@
+#include "rtp_packet_av1.h"
+
+namespace minirtc {
+RtpPacketAv1::RtpPacketAv1() {}
+
+RtpPacketAv1::~RtpPacketAv1() {}
+
+bool RtpPacketAv1::GetFrameHeaderInfo() {
+  if (PayloadSize() < 1) {
+    return false;
+  }
+  const uint8_t* frame_buffer = Payload();
+  av1_aggr_header_ = frame_buffer[0];
+  z_ = av1_aggr_header_ >> 7;
+  y_ = av1_aggr_header_ >> 6 & 0x01;
+  w_ = av1_aggr_header_ >> 4 & 0x03;
+  n_ = av1_aggr_header_ >> 3 & 0x01;
+
+  add_offset_to_payload(1);
+
+  return true;
+}
+}  // namespace minirtc

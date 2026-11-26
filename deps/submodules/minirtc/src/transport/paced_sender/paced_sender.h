@@ -1,0 +1,400 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-03-12
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _PACED_SENDER_H_
+#define _PACED_SENDER_H_
+
+#include <array>
+#include <atomic>
+#include <deque>
+#include <memory>
+#include <mutex>
+
+#include "api/array_view.h"
+#include "api/transport/network_types.h"
+#include "api/units/data_rate.h"
+#include "api/units/data_size.h"
+#include "api/units/time_delta.h"
+#include "api/units/timestamp.h"
+#include "fec_adaptation_controller.h"
+#include "ice_agent.h"
+#include "log.h"
+#include "pacing_controller.h"
+#include "rtc_base/numerics/exp_filter.h"
+#include "rtp_packet_pacer.h"
+#include "rtp_packet_to_send.h"
+#include "task_queue.h"
+
+namespace minirtc {
+class PacedSender : public webrtc::RtpPacketPacer,
+                    public webrtc::PacingController::PacketSender {
+ public:
+  static const int kNoPacketHoldback;
+
+  PacedSender(std::shared_ptr<IceAgent> ice_agent,
+              std::shared_ptr<webrtc::Clock> clock,
+              std::shared_ptr<TaskQueue> task_queue,
+              bool bounded_video_queue = false,
+              bool disable_receiver_padding_probing = false);
+  ~PacedSender();
+
+ public:
+  int Send() { return 0; }
+
+  int EnqueueRtpPackets(std::vector<std::unique_ptr<RtpPacket>>& rtp_packets,
+                        int64_t captured_timestamp_us,
+                        const std::string& stream_name);
+
+  int EnqueueRtpPackets(
+      std::vector<std::unique_ptr<webrtc::RtpPacketToSend>>& rtp_packets);
+
+  int EnqueueRtpPacket(std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet);
+
+ public:
+  void SetOnSentPacketFunc(
+      std::function<void(std::unique_ptr<webrtc::RtpPacketToSend>,
+                         const webrtc::PacedPacketInfo&)>
+          on_sent_packet_func);
+
+  void SetOnRtpPacketDroppedFunc(
+      std::function<void(const webrtc::RtpPacketToSend&)> callback);
+  void SetProbeAbortedCallback(
+      std::function<void(int, webrtc::Timestamp, const char*)> callback);
+  void SetProbeCompletedCallback(
+      std::function<void(int, int, webrtc::Timestamp)> callback);
+  void SetVideoSendPausedCallback(
+      std::function<void(bool, webrtc::Timestamp)> callback);
+  void RegisterVideoSsrc(uint32_t media_ssrc, uint32_t rtx_ssrc,
+                         std::function<void()> on_keyframe);
+  void UnregisterVideoSsrc(uint32_t media_ssrc);
+
+  void SetGeneratePaddingFunc(
+      std::function<std::vector<std::unique_ptr<RtpPacket>>(uint32_t, int64_t)>
+          generat_padding_func);
+
+  void Shutdown();
+  bool PostFecTask(AnyInvocable<void()> task, int delay_ms) {
+    return !is_shutdown_.load() &&
+           task_queue_pacer_->PostDelayedTask(std::move(task), delay_ms);
+  }
+  void SetFecBudgets(const std::map<uint32_t, int64_t>& rates,
+                    int64_t total_bps, uint64_t version);
+  uint64_t FecDroppedPackets() const { return fec_dropped_.load(); }
+  // Aggregate RTX allowance across all video streams, in wire bits/s.
+  void SetRtxBudget(int64_t bps, uint64_t version);
+  uint64_t RtxDroppedPackets() const { return rtx_dropped_.load(); }
+  struct RtxDropStats {
+    uint64_t total = 0;
+    uint64_t superseded = 0;
+    uint64_t paused = 0;
+    uint64_t not_ready = 0;
+    uint64_t congested = 0;
+    uint64_t expired = 0;
+    uint64_t budget = 0;
+    uint64_t deferred_overflow = 0;
+    uint64_t queue_discard = 0;
+    uint64_t shutdown = 0;
+  };
+  // Cumulative diagnostics. total is the sum of this snapshot's categories.
+  RtxDropStats GetRtxDropStats() const;
+  // Cumulative admissions deferred while waiting for RTX credit.
+  uint64_t RtxDeferredPackets() const { return rtx_deferred_.load(); }
+
+ public:
+  void SendPacket(std::unique_ptr<webrtc::RtpPacketToSend> packet,
+                  const webrtc::PacedPacketInfo& cluster_info) override {
+    if (is_shutdown_.load()) {
+      NotifyRtxDropped(*packet, RtxDropReason::kShutdown);
+      return;
+    }
+    if (ShouldDropVideoPacket(*packet)) {
+      NotifyRtxDropped(*packet, VideoRtxDropReason(*packet));
+      return;
+    }
+    if (packet->packet_type() == webrtc::RtpPacketMediaType::kRetransmission) {
+      std::optional<RtxDropReason> reason;
+      if (rtx_congested_) reason = RtxDropReason::kCongested;
+      else if (RtxExpired(*packet)) reason = RtxDropReason::kExpired;
+      else if (rtx_budget_bps_ == 0 ||
+               !rtx_send_budget_.Consume(packet->size() + 64,
+                                         clock_->CurrentTime().ms()))
+        reason = RtxDropReason::kBudget;
+      if (reason) {
+        NotifyRtxDropped(*packet, *reason);
+        return;
+      }
+    }
+    if (packet->packet_type() == webrtc::RtpPacketMediaType::kForwardErrorCorrection) {
+      const auto now = clock_->CurrentTime();
+      if ((packet->fec_deadline() && now >= *packet->fec_deadline()) ||
+          now - packet->capture_time() >= webrtc::TimeDelta::Millis(150) ||
+          (fec_budget_managed_ &&
+           (!fec_stream_budgets_.count(packet->Ssrc()) ||
+            !fec_stream_budgets_.at(packet->Ssrc()).Consume(packet->size() + 64, now.ms()) ||
+            !fec_budget_.Consume(packet->size() + 64, now.ms())))) {
+        ++fec_dropped_;
+        return;
+      }
+    }
+    if (on_sent_packet_func_) {
+      // Assign the sequence number at the final serialized send point so all
+      // packets sharing an SSRC (including RTX and padding) use one sequence
+      // space in their actual transmission order.
+      auto sequence_it =
+          ssrc_seq_.try_emplace(packet->Ssrc(), uint16_t{1}).first;
+      packet->UpdateSequenceNumber(sequence_it->second++);
+
+      on_sent_packet_func_(std::move(packet), cluster_info);
+    }
+  }
+  // Should be called after each call to SendPacket().
+  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> FetchFec() override {
+    std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> fec_packets;
+    return fec_packets;
+  }
+  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> GeneratePadding(
+      webrtc::DataSize size) override;
+
+  // TODO(bugs.webrtc.org/1439830): Make pure once subclasses adapt.
+  void OnBatchComplete() override {}
+
+  // TODO(bugs.webrtc.org/11340): Make pure  once downstream projects
+  // have been updated.
+  void OnAbortedRetransmissions(
+      uint32_t /* ssrc */,
+      rtc::ArrayView<const uint16_t> /* sequence_numbers */) override {}
+  std::optional<uint32_t> GetRtxSsrcForMedia(uint32_t ssrc) const override;
+  void OnPacketDiscarded(const webrtc::RtpPacketToSend& packet) override;
+  void OnKeyframeEnqueued(uint32_t ssrc,
+                          webrtc::Timestamp capture_time) override;
+
+ public:
+  void SetSendBurstInterval(webrtc::TimeDelta burst_interval);
+
+  // A probe may be sent without first waing for a media packet.
+  void SetAllowProbeWithoutMediaPacket(bool allow);
+
+  // Stops all sending and discards pending probes while the media transport
+  // is unavailable.
+  void SetTransportReady(bool ready);
+
+  // Ensure that necessary delayed tasks are scheduled.
+  void EnsureStarted();
+
+  // Methods implementing RtpPacketSender.
+
+  // Adds the packet to the queue and calls
+  // PacingController::PacedSender::SendPacket() when it's time to send.
+  void EnqueuePackets(
+      std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> packets);
+  void EnqueuePacket(std::unique_ptr<webrtc::RtpPacketToSend> packet);
+  // Remove any pending packets matching this SSRC from the packet queue.
+  void RemovePacketsForSsrc(uint32_t ssrc);
+
+  void CreateProbeClusters(
+      std::vector<webrtc::ProbeClusterConfig> probe_cluster_configs) override;
+
+  // 0 restores unrestricted probing; positive values bound probe rates.
+  // Video pause state is independent of this bandwidth budget.
+  void SetProbeBitrateLimit(int max_bitrate_bps);
+  void PauseProbingUntil(webrtc::Timestamp until);
+  void SetVideoSendPaused(bool paused, const std::vector<uint32_t>& ssrcs,
+                          webrtc::Timestamp pause_time);
+
+  // Temporarily pause all sending.
+  void Pause() override;
+
+  // Resume sending packets.
+  void Resume() override;
+
+  void SetCongested(bool congested) override;
+
+  // Sets the pacing rates. Must be called once before packets can be sent.
+  void SetPacingRates(webrtc::DataRate pacing_rate,
+                      webrtc::DataRate padding_rate) override;
+
+  // Currently audio traffic is not accounted for by pacer and passed through.
+  // With the introduction of audio BWE, audio traffic will be accounted for
+  // in the pacer budget calculation. The audio traffic will still be injected
+  // at high priority.
+  void SetAccountForAudioPackets(bool account_for_audio) override;
+
+  void SetIncludeOverhead() override;
+  void SetTransportOverhead(webrtc::DataSize overhead_per_packet) override;
+
+  // Time since the oldest packet currently in the queue was added.
+  webrtc::TimeDelta OldestPacketWaitTime() const override;
+
+  // Sum of payload + padding bytes of all packets currently in the pacer queue.
+  webrtc::DataSize QueueSizeData() const override;
+
+  // Returns the time when the first packet was sent.
+  std::optional<webrtc::Timestamp> FirstSentPacketTime() const override;
+
+  // Returns the expected number of milliseconds it will take to send the
+  // current packets in the queue, given the current size and bitrate, ignoring
+  // priority.
+  webrtc::TimeDelta ExpectedQueueTime() const override;
+
+  // Set the average upper bound on pacer queuing delay. The pacer may send at
+  // a higher rate than what was configured via SetPacingRates() in order to
+  // keep ExpectedQueueTimeMs() below `limit_ms` on average.
+  void SetQueueTimeLimit(webrtc::TimeDelta limit) override;
+
+ protected:
+  // Exposed as protected for test.
+  struct Stats {
+    Stats()
+        : oldest_packet_enqueue_time(webrtc::Timestamp::MinusInfinity()),
+          queue_size(webrtc::DataSize::Zero()),
+          expected_queue_time(webrtc::TimeDelta::Zero()) {}
+    webrtc::Timestamp oldest_packet_enqueue_time;
+    webrtc::DataSize queue_size;
+    webrtc::TimeDelta expected_queue_time;
+    std::optional<webrtc::Timestamp> first_sent_packet_time;
+  };
+  void OnStatsUpdated(const Stats& stats);
+
+ private:
+  void RunOrPost(AnyInvocable<void()> task);
+  void EnqueuePacketsOnQueue(
+      std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> packets);
+  void EnqueuePacketOnQueue(
+      std::unique_ptr<webrtc::RtpPacketToSend> packet);
+  void EnqueueReadyPacket(std::unique_ptr<webrtc::RtpPacketToSend> packet);
+  void RemovePacketsForSsrcOnQueue(uint32_t ssrc);
+  void DeferRtx(std::unique_ptr<webrtc::RtpPacketToSend> packet);
+  void FlushDeferredRtx();
+  enum class RtxDropReason {
+    kSuperseded, kPaused, kNotReady, kCongested, kExpired, kBudget,
+    kDeferredOverflow, kQueueDiscard, kShutdown, kCount
+  };
+  void NotifyRtxDropped(const webrtc::RtpPacketToSend& packet,
+                        RtxDropReason reason);
+  // Called only after ShouldDropVideoPacket has established the drop.
+  RtxDropReason VideoRtxDropReason(const webrtc::RtpPacketToSend& packet) const;
+  void NotifyProbeAborted(int id, const char* reason);
+  bool RtxExpired(const webrtc::RtpPacketToSend& packet) const;
+
+  // Call in response to state updates that could warrant sending out packets.
+  // Protected against re-entry from packet sent receipts.
+  void MaybeScheduleProcessPackets();
+  // Check if it is time to send packets, or schedule a delayed task if not.
+  // Use Timestamp::MinusInfinity() to indicate that this call has _not_
+  // been scheduled by the pacing controller. If this is the case, check if we
+  // can execute immediately otherwise schedule a delay task that calls this
+  // method again with desired (finite) scheduled process time.
+  void MaybeProcessPackets(webrtc::Timestamp scheduled_process_time);
+
+  void UpdateStats();
+  Stats GetStats() const;
+
+ private:
+  std::shared_ptr<IceAgent> ice_agent_ = nullptr;
+  webrtc::PacingController pacing_controller_;
+  std::function<void(std::unique_ptr<webrtc::RtpPacketToSend>,
+                     const webrtc::PacedPacketInfo&)>
+      on_sent_packet_func_ = nullptr;
+  std::function<void(const webrtc::RtpPacketToSend&)>
+      on_rtp_packet_dropped_func_;
+
+  std::function<std::vector<std::unique_ptr<RtpPacket>>(uint32_t, int64_t)>
+      generat_padding_func_ = nullptr;
+
+ private:
+  std::shared_ptr<webrtc::Clock> clock_ = nullptr;
+
+ private:
+  const webrtc::TimeDelta max_hold_back_window_;
+  const int max_hold_back_window_in_packets_;
+  // We want only one (valid) delayed process task in flight at a time.
+  // If the value of `next_process_time_` is finite, it is an id for a
+  // delayed task that will call MaybeProcessPackets() with that time
+  // as parameter.
+  // Timestamp::MinusInfinity() indicates no valid pending task.
+  webrtc::Timestamp next_process_time_;
+
+  // Indicates if this task queue is started. If not, don't allow
+  // posting delayed tasks yet.
+  bool is_started_;
+
+  bool transport_ready_;
+
+  // Indicates if this task queue is shutting down. If so, don't allow
+  // posting any more delayed tasks as that can cause the task queue to
+  // never drain.
+  std::atomic<bool> is_shutdown_;
+
+  // Filtered size of enqueued packets, in bytes.
+  rtc::ExpFilter packet_size_;
+  bool include_overhead_;
+
+  Stats current_stats_;
+  mutable std::mutex stats_mutex_;
+  // Protects against ProcessPackets reentry from packet sent receipts.
+  bool processing_packets_ = false;
+  int probe_bitrate_limit_bps_ = 0;  // Accessed only on the pacer queue.
+  webrtc::Timestamp probe_pause_until_ = webrtc::Timestamp::MinusInfinity();
+  bool video_send_paused_ = false;  // Accessed only on the pacer queue.
+  std::function<void(int, webrtc::Timestamp, const char*)> probe_aborted_callback_;
+  std::function<void(bool, webrtc::Timestamp)> video_send_paused_callback_;
+  const bool disable_receiver_padding_probing_;
+  bool allow_probe_without_media_packet_ = false;  // Pacer queue only.
+  // Latch per connection: static content must retain sender ALR probing.
+  bool has_local_video_ = false;  // Pacer queue only.
+  webrtc::Timestamp video_pause_time_ = webrtc::Timestamp::MinusInfinity();
+  bool ShouldDropVideoPacket(const webrtc::RtpPacketToSend& packet) const {
+    if (packet.packet_type() == webrtc::RtpPacketMediaType::kAudio) return false;
+    if (video_send_paused_ || (video_pause_time_.IsFinite() &&
+                              packet.capture_time() <= video_pause_time_))
+      return true;
+    // History tasks can post old RTX after its replacement keyframe was
+    // queued. Keep a per-media watermark, independent of sequence wrapping.
+    const auto stream = video_streams_.find(
+        packet.original_ssrc().value_or(packet.Ssrc()));
+    return stream != video_streams_.end() && packet.capture_time().IsFinite() &&
+           packet.capture_time() < stream->second.keyframe_capture_time;
+  }
+
+  struct VideoStream {
+    uint32_t rtx_ssrc;
+    webrtc::Timestamp keyframe_capture_time = webrtc::Timestamp::MinusInfinity();
+    std::function<void()> on_keyframe;
+  };
+  std::map<uint32_t, VideoStream> video_streams_;  // Pacer queue only.
+
+  std::shared_ptr<TaskQueue> task_queue_pacer_;
+  int64_t transport_seq_ = 0;
+  std::map<uint32_t, uint16_t> ssrc_seq_;
+  FecRateBudget fec_budget_;
+  std::map<uint32_t, FecRateBudget> fec_stream_budgets_;
+  uint64_t fec_budget_version_ = 0;
+  bool fec_budget_managed_ = false;
+  std::atomic<uint64_t> fec_dropped_{0};
+  // Bound both queued requests and actual sends: a congested queue or a rate
+  // decrease must not turn an earlier allowance into a recovery burst.
+  FecRateBudget rtx_admission_budget_;
+  FecRateBudget rtx_send_budget_;
+  struct DeferredRtx {
+    std::unique_ptr<webrtc::RtpPacketToSend> packet;
+    webrtc::Timestamp deadline;
+  };
+  std::deque<DeferredRtx> deferred_rtx_;
+  size_t deferred_rtx_bytes_ = 0;
+  int64_t rtx_budget_bps_ = -1;
+  uint64_t rtx_budget_version_ = 0;
+  bool rtx_congested_ = false;  // Accessed only on the pacer queue.
+  std::atomic<uint64_t> rtx_dropped_{0};
+  std::array<std::atomic<uint64_t>, static_cast<size_t>(RtxDropReason::kCount)>
+      rtx_drop_reasons_{};
+  std::atomic<uint64_t> rtx_deferred_{0};
+
+  webrtc::Timestamp last_send_time_;
+  webrtc::Timestamp last_call_time_;
+};
+}  // namespace minirtc
+
+#endif

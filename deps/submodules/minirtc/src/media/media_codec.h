@@ -1,0 +1,187 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-05-14
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _MEDIA_CODEC_H_
+#define _MEDIA_CODEC_H_
+
+#include <stdio.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "audio_frame.h"
+#include "clock/system_clock.h"
+#include "decoded_frame.h"
+#include "encoded_frame.h"
+#include "log.h"
+#include "media_codec.h"
+#include "minirtc.h"
+#include "raw_frame.h"
+#include "received_frame.h"
+#include "bitrate_limits.h"
+
+#define MINIRTC_INIT_WIDTH 1920
+#define MINIRTC_INIT_HEIGHT 1080
+#define MINIRTC_INIT_BITRATE 8'000'000
+#define MINIRTC_MIN_BITRATE 1'000'000
+#define MINIRTC_AVERAGE_BITRATE 12'000'000
+#define MINIRTC_MIN_FRAME_RATE 15
+#define MINIRTC_MAX_FRAME_RATE 144
+#define MINIRTC_KEY_FRAME_INTERVAL 3000
+#define MINIRTC_MAX_PAYLOAD_SIZE 1150
+
+namespace minirtc {
+
+using EncodedAudioCallback =
+    std::function<int(char* encoded_audio_buffer, size_t size,
+                      uint32_t samples_per_channel)>;
+
+using VideoCodecType = MiniRtcVideoCodec;
+
+class MediaCodecConfig {
+ public:
+  MediaCodecConfig()
+      : init_width(MINIRTC_INIT_WIDTH),
+        init_height(MINIRTC_INIT_HEIGHT),
+        init_bitrate(MINIRTC_INIT_BITRATE),
+        min_bitrate(MINIRTC_MIN_BITRATE),
+        average_bitrate(MINIRTC_AVERAGE_BITRATE),
+        max_bitrate(kDefaultMaxEncoderBitrateBps),
+        min_frame_rate(MINIRTC_MIN_FRAME_RATE),
+        max_frame_rate(MINIRTC_MAX_FRAME_RATE),
+        key_frame_interval(MINIRTC_KEY_FRAME_INTERVAL),
+        max_payload_size(MINIRTC_MAX_PAYLOAD_SIZE),
+        video_content_type(MiniRtcVideoContentType::ScreenContent),
+        video_degradation_preference(
+            MiniRtcVideoDegradationPreference::MaintainResolution) {}
+  ~MediaCodecConfig() {}
+
+  bool UseDesktopRealtimeRateControl() const {
+    return desktop_realtime_rate_control &&
+           video_content_type == MiniRtcVideoContentType::ScreenContent;
+  }
+
+  bool desktop_realtime_rate_control = true;
+  bool audio_fec_enabled = false;
+  int init_width;
+  int init_height;
+  int init_bitrate;
+  int min_bitrate;
+  int average_bitrate;
+  int max_bitrate;
+  int min_frame_rate;
+  int max_frame_rate;
+  int key_frame_interval;
+  int max_payload_size;
+  MiniRtcVideoContentType video_content_type;
+  MiniRtcVideoDegradationPreference video_degradation_preference;
+};
+
+class MediaCodec {
+ public:
+  MediaCodec() {}
+  virtual ~MediaCodec() {}
+
+ public:
+  virtual int Init() {
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  virtual int Init(const MediaCodecConfig& config) {
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  virtual int Encode(
+      const RawFrame& raw_frame,
+      std::function<int(const EncodedFrame& encoded_frame)> on_encoded_image) {
+    // Video encoders that rebuild themselves when the input dimensions change
+    // must guarantee that the first frame emitted at the new resolution is a
+    // key frame carrying the codec configuration needed by the decoder.
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  virtual int Decode(
+      std::unique_ptr<ReceivedFrame> received_frame,
+      std::function<void(const DecodedFrame*)> on_receive_decoded_frame) {
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  virtual int Encode(const uint8_t* data, size_t size,
+                     EncodedAudioCallback on_encoded_audio_buffer) {
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  virtual int Decode(
+      const uint8_t* data, size_t size,
+      std::function<void(uint8_t*, int)> on_receive_decoded_frame) {
+    LOG_INFO("Not implemented");
+    return 0;
+  }
+
+  // Invoked on the decode queue before a fresh keyframe if outstanding
+  // asynchronous submissions stopped completing.
+  virtual void RecoverAtKeyFrame() {}
+
+  virtual int ForceIdr() { return 0; }
+
+  virtual int SetTargetBitrate(int bitrate) { return 0; }
+
+  // Keep encoder rate control aligned with admission when a transport adapts
+  // FPS. Unsupported encoders retain their configured rate.
+  virtual int SetTargetFrameRate(int frame_rate) { return -1; }
+
+  // Advisory rate of frames actually admitted to Encode(), independent of the
+  // configured capture ceiling. Implementations must not rebuild their codec
+  // for routine measurement updates. Unsupported encoders keep their settings.
+  virtual bool SupportsInputFrameRateUpdates() const { return false; }
+  virtual int SetInputFrameRate(int frame_rate) { return -1; }
+
+  virtual bool SupportsDynamicEncodingSpeedPriority() const { return false; }
+
+  virtual bool SupportsNativeFrameInput(
+      MiniRtcNativeVideoFrameType frame_type) const {
+    (void)frame_type;
+    return false;
+  }
+
+  // Hardware encoders that can separate their internal stages report how long
+  // the last Encode() spent copying the frame into device memory and in the
+  // encoder call itself. Everything else returns false, which keeps the caller
+  // from attributing the whole call to one stage. Not part of the render or
+  // media contract: diagnostics only, no behaviour depends on it.
+  virtual bool GetLastEncodeStageTimingUs(int64_t* upload_us,
+                                          int64_t* submit_us) const {
+    (void)upload_us;
+    (void)submit_us;
+    return false;
+  }
+
+  virtual int SetPrioritizeEncodingSpeedOverQuality(bool prioritize_speed) {
+    return -1;
+  }
+
+  virtual int GetResolution(int* width, int* height) const { return 0; }
+
+  virtual std::string GetEncoderName() const { return ""; }
+
+  virtual std::string GetDecoderName() const { return ""; }
+};
+}  // namespace minirtc
+
+#endif

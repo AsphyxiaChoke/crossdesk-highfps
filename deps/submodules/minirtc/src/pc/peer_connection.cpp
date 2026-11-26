@@ -1,0 +1,1676 @@
+#include "peer_connection.h"
+
+#include <chrono>
+#include <array>
+#include <exception>
+#include <regex>
+
+#include "INIReader.h"
+#include "common.h"
+#include "ice_utils.h"
+#include "join_failure.h"
+#include "log.h"
+#include "nlohmann/json.hpp"
+#include "signal_server_address.h"
+
+namespace minirtc {
+
+using nlohmann::json;
+
+namespace {
+
+const char* ConnectionStatusToString(MiniRtcConnectionStatus status) {
+  switch (status) {
+    case MiniRtcConnectionStatus::MiniRtcConnectionConnecting:
+      return "connecting";
+    case MiniRtcConnectionStatus::MiniRtcConnectionConnected:
+      return "connected";
+    case MiniRtcConnectionStatus::MiniRtcConnectionGathering:
+      return "gathering";
+    case MiniRtcConnectionStatus::MiniRtcConnectionDisconnected:
+      return "disconnected";
+    case MiniRtcConnectionStatus::MiniRtcConnectionFailed:
+      return "failed";
+    case MiniRtcConnectionStatus::MiniRtcConnectionClosed:
+      return "closed";
+    case MiniRtcConnectionStatus::MiniRtcConnectionIncorrectPassword:
+      return "incorrect_password";
+    case MiniRtcConnectionStatus::MiniRtcConnectionNoSuchTransmissionId:
+      return "no_such_transmission_id";
+    case MiniRtcConnectionStatus::MiniRtcConnectionRemoteUnavailable:
+      return "remote_unavailable";
+    default:
+      return "unknown";
+  }
+}
+
+const char* SignalStatusToString(MiniRtcSignalStatus status) {
+  switch (status) {
+    case MiniRtcSignalStatus::MiniRtcSignalConnecting:
+      return "connecting";
+    case MiniRtcSignalStatus::MiniRtcSignalConnected:
+      return "connected";
+    case MiniRtcSignalStatus::MiniRtcSignalFailed:
+      return "failed";
+    case MiniRtcSignalStatus::MiniRtcSignalClosed:
+      return "closed";
+    case MiniRtcSignalStatus::MiniRtcSignalReconnecting:
+      return "reconnecting";
+    case MiniRtcSignalStatus::MiniRtcSignalServerClosed:
+      return "server_closed";
+    case MiniRtcSignalStatus::MiniRtcSignalTlsCertError:
+      return "tls_cert_error";
+    default:
+      return "unknown";
+  }
+}
+
+bool IsValidTurnMode(MiniRtcTurnMode mode) {
+  return mode >= MiniRtcTurnMode::MiniRtcTurnDisabled && mode <= MiniRtcTurnMode::MiniRtcTurnForceTcp;
+}
+
+int NormalizeVideoFrameRate(int frame_rate) {
+  return (frame_rate >= 15 && frame_rate <= 240) ? frame_rate : 60;
+}
+
+MiniRtcVideoContentType ParseVideoContentType(const std::string& value) {
+  if (value == "realtime_video") {
+    return MiniRtcVideoContentType::RealtimeVideo;
+  }
+  if (value != "screen_content") {
+    LOG_WARN("Invalid video content type [{}], using screen_content", value);
+  }
+  return MiniRtcVideoContentType::ScreenContent;
+}
+
+MiniRtcVideoContentType NormalizeVideoContentType(MiniRtcVideoContentType value) {
+  if (value == MiniRtcVideoContentType::RealtimeVideo ||
+      value == MiniRtcVideoContentType::ScreenContent) {
+    return value;
+  }
+  LOG_WARN("Invalid video content type [{}], using screen_content",
+           static_cast<int>(value));
+  return MiniRtcVideoContentType::ScreenContent;
+}
+
+MiniRtcVideoDegradationPreference ParseVideoDegradationPreference(
+    const std::string& value) {
+  if (value == "maintain_resolution" || value == "quality_priority") {
+    return MiniRtcVideoDegradationPreference::MaintainResolution;
+  }
+  if (value == "balanced") {
+    return MiniRtcVideoDegradationPreference::Balanced;
+  }
+  if (value != "maintain_frame_rate" && value != "frame_rate_priority") {
+    LOG_WARN(
+        "Invalid video degradation preference [{}], using "
+        "maintain_resolution",
+        value);
+    return MiniRtcVideoDegradationPreference::MaintainResolution;
+  }
+  return MiniRtcVideoDegradationPreference::MaintainFrameRate;
+}
+
+MiniRtcVideoDegradationPreference NormalizeVideoDegradationPreference(
+    MiniRtcVideoDegradationPreference value) {
+  if (value == MiniRtcVideoDegradationPreference::MaintainFrameRate ||
+      value == MiniRtcVideoDegradationPreference::MaintainResolution ||
+      value == MiniRtcVideoDegradationPreference::Balanced) {
+    return value;
+  }
+  LOG_WARN(
+      "Invalid video degradation preference [{}], using "
+      "maintain_resolution",
+      static_cast<int>(value));
+  return MiniRtcVideoDegradationPreference::MaintainResolution;
+}
+
+const char* VideoDegradationPreferenceToString(
+    MiniRtcVideoDegradationPreference value) {
+  switch (value) {
+    case MiniRtcVideoDegradationPreference::MaintainFrameRate:
+      return "maintain_frame_rate";
+    case MiniRtcVideoDegradationPreference::Balanced:
+      return "balanced";
+    case MiniRtcVideoDegradationPreference::MaintainResolution:
+    default:
+      return "maintain_resolution";
+  }
+}
+
+const char* TurnModeToString(MiniRtcTurnMode mode) {
+  switch (mode) {
+    case MiniRtcTurnMode::MiniRtcTurnDisabled:
+      return "disabled";
+    case MiniRtcTurnMode::MiniRtcTurnAutoUdpTcp:
+      return "auto_udp_tcp";
+    case MiniRtcTurnMode::MiniRtcTurnForceUdp:
+      return "force_udp";
+    case MiniRtcTurnMode::MiniRtcTurnForceTcp:
+      return "force_tcp";
+    default:
+      return "invalid";
+  }
+}
+
+MiniRtcTurnMode ParseTurnMode(const std::string& mode, bool legacy_enabled) {
+  if (mode.empty()) {
+    return legacy_enabled ? MiniRtcTurnMode::MiniRtcTurnAutoUdpTcp
+                          : MiniRtcTurnMode::MiniRtcTurnDisabled;
+  }
+  if (mode == "disabled" || mode == "0") {
+    return MiniRtcTurnMode::MiniRtcTurnDisabled;
+  }
+  if (mode == "auto" || mode == "auto_udp_tcp" || mode == "1") {
+    return MiniRtcTurnMode::MiniRtcTurnAutoUdpTcp;
+  }
+  if (mode == "force_udp" || mode == "2") {
+    return MiniRtcTurnMode::MiniRtcTurnForceUdp;
+  }
+  if (mode == "force_tcp" || mode == "3") {
+    return MiniRtcTurnMode::MiniRtcTurnForceTcp;
+  }
+
+  LOG_WARN("Invalid TURN mode [{}], falling back to legacy enable flag", mode);
+  return legacy_enabled ? MiniRtcTurnMode::MiniRtcTurnAutoUdpTcp
+                        : MiniRtcTurnMode::MiniRtcTurnDisabled;
+}
+
+}  // namespace
+
+PeerConnection::PeerConnection() {}
+
+PeerConnection::~PeerConnection() { user_data_ = nullptr; }
+
+int PeerConnection::Init(PeerConnectionParams params) {
+  if (inited_) {
+    LOG_INFO("Peer already inited");
+    return 0;
+  }
+
+  user_id_with_pwd_ = params.user_id ? params.user_id : "";
+  reconnect_login_.Clear();
+  auto at_pos = user_id_with_pwd_.find('@');
+  if (at_pos != std::string::npos) {
+    user_id_ = user_id_with_pwd_.substr(0, at_pos);
+  } else {
+    user_id_ = user_id_with_pwd_;
+  }
+
+  StartingBitrates starting_bitrates;
+  bool disable_receiver_padding_probing = false;
+  if (params.use_cfg_file) {
+    INIReader reader(params.cfg_path);
+    const StartingBitrates defaults;
+    disable_receiver_padding_probing = reader.GetBoolean(
+        "bandwidth", "disable_receiver_padding_probing", false);
+    starting_bitrates.direct_bps = StartingBitrates::Parse(
+        reader.Get("bandwidth", "direct_start_bitrate_bps", ""),
+        defaults.direct_bps);
+    starting_bitrates.relay_bps = StartingBitrates::Parse(
+        reader.Get("bandwidth", "relay_start_bitrate_bps", ""),
+        defaults.relay_bps);
+    connection_info_.desktop_realtime_rate_control = !reader.GetBoolean(
+        "video encoding", "disable_desktop_realtime_rate_control", false);
+    cfg_signal_server_ip_ = reader.Get("signal server", "ip", "-1");
+    cfg_signal_server_port_ = reader.Get("signal server", "port", "-1");
+    cfg_hardware_acceleration_ =
+        reader.Get("hardware acceleration", "turn_on", "false");
+    cfg_native_video_output_ =
+        reader.Get("native video output", "turn_on", "false");
+    cfg_av1_encoding_ = reader.Get("av1 encoding", "turn_on", "false");
+    cfg_turn_mode_ = reader.Get("turn mode", "mode", "");
+    cfg_enable_turn_ = reader.Get("enable turn", "turn_on", "false");
+    cfg_enable_srtp_ = reader.Get("enable srtp", "turn_on", "true");
+    cfg_video_content_type_ =
+        reader.Get("video content type", "type", "screen_content");
+    cfg_video_quality_ = reader.Get("video quality", "quality", "high");
+    cfg_video_frame_rate_ = reader.Get("video frame rate", "fps", "60");
+    cfg_video_degradation_preference_ = reader.Get(
+        "video degradation preference", "preference", "maintain_resolution");
+
+    signal_server_port_ = stoi(cfg_signal_server_port_);
+
+    hardware_acceleration_ =
+        cfg_hardware_acceleration_ == "true" ? true : false;
+    native_video_output_ =
+        cfg_native_video_output_ == "true" ? true : false;
+    video_codec_ = cfg_av1_encoding_ == "true" ? MiniRtcVideoCodec::AV1 : MiniRtcVideoCodec::H264;
+    if (reader.Get("h265 encoding", "turn_on", "false") == "true")
+      video_codec_ = MiniRtcVideoCodec::H265;
+    turn_mode_ = ParseTurnMode(cfg_turn_mode_, cfg_enable_turn_ == "true");
+    enable_srtp_ = cfg_enable_srtp_ == "true" ? true : false;
+    video_content_type_ = ParseVideoContentType(cfg_video_content_type_);
+    video_frame_rate_ =
+        NormalizeVideoFrameRate(std::stoi(cfg_video_frame_rate_));
+    video_degradation_preference_ = ParseVideoDegradationPreference(
+        cfg_video_degradation_preference_);
+    if (cfg_video_quality_ == "low") {
+      video_quality_ = MiniRtcVideoQuality::MiniRtcVideoQualityLow;
+    } else if (cfg_video_quality_ == "medium") {
+      video_quality_ = MiniRtcVideoQuality::MiniRtcVideoQualityMedium;
+    } else {
+      video_quality_ = MiniRtcVideoQuality::MiniRtcVideoQualityHigh;
+    }
+  } else {
+    starting_bitrates = StartingBitrates::Normalize(
+        params.direct_start_bitrate_bps, params.relay_start_bitrate_bps);
+    disable_receiver_padding_probing = params.disable_receiver_padding_probing;
+    connection_info_.desktop_realtime_rate_control =
+        params.desktop_encoding_mode == MiniRtcDesktopEncodingMode::LowLoad;
+    cfg_signal_server_ip_ = params.signal_server_ip;
+    signal_server_port_ = params.signal_server_port;
+    hardware_acceleration_ = params.hardware_acceleration;
+    native_video_output_ = params.native_video_output;
+    video_codec_ = params.video_codec;
+    if (IsValidTurnMode(params.turn_mode)) {
+      turn_mode_ = params.turn_mode;
+    } else {
+      LOG_WARN("Invalid TURN mode value [{}], disabling TURN",
+               static_cast<int>(params.turn_mode));
+      turn_mode_ = MiniRtcTurnMode::MiniRtcTurnDisabled;
+    }
+    enable_srtp_ = params.enable_srtp;
+    video_content_type_ = NormalizeVideoContentType(params.video_content_type);
+    video_quality_ = params.video_quality;
+    video_frame_rate_ = NormalizeVideoFrameRate(params.video_frame_rate);
+    video_degradation_preference_ = NormalizeVideoDegradationPreference(
+        params.video_degradation_preference);
+
+    cfg_signal_server_port_ = std::to_string(signal_server_port_);
+  }
+
+  const auto address = ParseSignalServerAddress(cfg_signal_server_ip_);
+  if (!address) {
+    LOG_ERROR("Invalid signaling server address");
+    return -1;
+  }
+  signal_server_port_ = address->port.value_or(signal_server_port_);
+  if (signal_server_port_ < 1 || signal_server_port_ > 65535) {
+    LOG_ERROR("Invalid signaling server port");
+    return -1;
+  }
+  uri_ = address->Url(signal_server_port_);
+
+  legacy_turn_config_.reset();
+  per_connection_ice_config_ = false;
+  connection_info_.starting_bitrates = starting_bitrates;
+  connection_info_.disable_receiver_padding_probing =
+      disable_receiver_padding_probing;
+  connection_info_.hardware_acceleration = hardware_acceleration_;
+  connection_info_.native_video_output = native_video_output_;
+  connection_info_.trickle_ice = trickle_ice_;
+  connection_info_.reliable_ice = reliable_ice_;
+  connection_info_.turn_mode = turn_mode_;
+  connection_info_.enable_srtp = enable_srtp_;
+  connection_info_.video_content_type = video_content_type_;
+  connection_info_.video_codec = video_codec_;
+  connection_info_.video_quality = video_quality_;
+  connection_info_.video_frame_rate = video_frame_rate_;
+  connection_info_.video_degradation_preference =
+      video_degradation_preference_;
+
+  LOG_INFO("Read config success, use configure file [{}]", params.use_cfg_file);
+
+  LOG_DEBUG("Signal server ip [{}] port [{}]", cfg_signal_server_ip_,
+            cfg_signal_server_port_);
+
+  LOG_INFO("Hardware accelerated codec [{}]",
+           hardware_acceleration_ ? "ON" : "OFF");
+  LOG_INFO("Native video output [{}]",
+           native_video_output_ ? "ON" : "OFF");
+  LOG_INFO("Video format [{}]", video_codec_ == MiniRtcVideoCodec::AV1 ? "AV1" :
+           video_codec_ == MiniRtcVideoCodec::H265 ? "H.265" : "H.264");
+  LOG_INFO("Video frame rate [{} fps]", video_frame_rate_);
+  LOG_INFO("Video degradation preference [{}]",
+           VideoDegradationPreferenceToString(
+               video_degradation_preference_));
+  LOG_INFO("Video content type [{}]",
+           video_content_type_ == MiniRtcVideoContentType::ScreenContent
+               ? "screen_content"
+               : "realtime_video");
+  LOG_INFO("TURN mode [{}]", TurnModeToString(turn_mode_));
+
+  on_receive_video_buffer_ = params.on_receive_video_buffer;
+  on_receive_audio_buffer_ = params.on_receive_audio_buffer;
+  on_receive_data_buffer_ = params.on_receive_data_buffer;
+
+  on_receive_video_frame_ = params.on_receive_video_frame;
+
+  on_signal_status_ = params.on_signal_status;
+  on_connection_status_ = params.on_connection_status;
+  on_net_status_report_ = params.on_net_status_report;
+  user_data_ = params.user_data;
+
+  connection_callbacks_.on_receive_video_frame = params.on_receive_video_frame;
+  connection_callbacks_.on_receive_encoded_video = params.on_receive_encoded_video;
+  connection_callbacks_.on_receive_audio_buffer =
+      params.on_receive_audio_buffer;
+  connection_callbacks_.on_receive_data_buffer = params.on_receive_data_buffer;
+
+  connection_callbacks_.on_net_status_report = params.on_net_status_report;
+  connection_callbacks_.user_data = user_data_;
+
+  on_signal_message_ = params.on_signal_message;
+  on_signal_exchange_ = params.on_signal_exchange;
+
+  on_receive_ws_msg_ = [this](const std::string& msg) {
+    if (ExchangeSignal(MiniRtcSignalExchangeStage::IncomingMessage, msg) != 0) return;
+    auto j = json::parse(msg, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_discarded() && j.contains("type") && j["type"].is_string()) {
+      std::string t = j["type"].get<std::string>();
+      if ((t == "change_password" || t == "revoke_reconnect_credential") &&
+          j.contains("status") && j["status"] == "success" &&
+          j.contains("user_id") && j["user_id"] == user_id_) {
+        reconnect_login_.Clear();
+      }
+      if (announcements_ && (t == "announcement_catalog" || t == "announcement_body")) {
+        json reply;
+        if (announcements_->Receive(j, reply)) {
+          if (!reply.is_null() && on_signal_message_) {
+            const auto text = reply.dump();
+            on_signal_message_(text.data(), text.size(), user_data_);
+          }
+          return;
+        }
+      }
+      if (internal_signal_types_.find(t) != internal_signal_types_.end()) {
+        ProcessSignal(msg);
+        return;
+      }
+    }
+    if (on_signal_message_) {
+      on_signal_message_(msg.data(), msg.size(), user_data_);
+    }
+  };
+
+  on_ws_status_ = [this](WsStatus ws_status) {
+    if (WsStatus::WsOpening == ws_status) {
+      ws_status_ = WsStatus::WsOpening;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalConnecting);
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalConnecting, user_id_.data(),
+                        user_id_.size(), user_data_);
+    } else if (WsStatus::WsOpened == ws_status) {
+      ws_status_ = WsStatus::WsOpened;
+      LOG_INFO("Login to signal server");
+      Login();
+    } else if (WsStatus::WsFailed == ws_status) {
+      ws_status_ = WsStatus::WsFailed;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalFailed);
+      ClearPeerConnections("signal failed");
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalFailed, user_id_.data(),
+                        user_id_.size(), user_data_);
+    } else if (WsStatus::WsClosed == ws_status) {
+      ws_status_ = WsStatus::WsClosed;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalClosed);
+      ClearPeerConnections("signal closed");
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalClosed, user_id_.data(),
+                        user_id_.size(), user_data_);
+    } else if (WsStatus::WsReconnecting == ws_status) {
+      ws_status_ = WsStatus::WsReconnecting;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalReconnecting);
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalReconnecting, user_id_.data(),
+                        user_id_.size(), user_data_);
+    } else if (WsStatus::WsServerClosed == ws_status) {
+      ws_status_ = WsStatus::WsServerClosed;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalServerClosed);
+      ClearPeerConnections("signal server closed");
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalServerClosed, user_id_.data(),
+                        user_id_.size(), user_data_);
+    } else if (WsStatus::WsTlsCertError == ws_status) {
+      ws_status_ = WsStatus::WsTlsCertError;
+      SetSignalStatus(MiniRtcSignalStatus::MiniRtcSignalTlsCertError);
+      ClearPeerConnections("signal TLS certificate error");
+      on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalTlsCertError, user_id_.data(),
+                        user_id_.size(), user_data_);
+    }
+  };
+
+  clock_ = std::make_shared<SystemClock>();
+  ws_transport_ = std::make_shared<WsClient>(on_receive_ws_msg_, on_ws_status_);
+  signal_sender_ = std::make_shared<CallbackSignalSender>(
+      [ws = ws_transport_](const std::string& message) {
+        if (ws->GetStatus() != WsStatus::WsOpened) return -1;
+        ws->Send(message);
+        return 0;
+      });
+  if (ws_transport_) {
+#ifndef NDEBUG
+    LOG_INFO("Signaling peer: client={} local_user={}",
+             ws_transport_->DiagnosticId(), user_id_);
+#endif
+    ws_transport_->Connect(uri_);
+  }
+
+  StartIceWorker();
+
+  // do {
+  // } while (MiniRtcSignalStatus::SignalConnected != GetSignalStatus());
+
+  LOG_INFO("Peer initialization finished");
+
+  inited_ = true;
+  return 0;
+}
+
+int PeerConnection::UpdateConnectionSettings(bool hardware_acceleration,
+                                            MiniRtcVideoCodec codec,
+                                            MiniRtcTurnMode turn_mode,
+                                            std::optional<bool> desktop_realtime_rate_control) {
+  if (!IsValidTurnMode(turn_mode) || codec > MiniRtcVideoCodec::H265) return -1;
+  std::lock_guard lock(connection_info_mutex_);
+  connection_info_.hardware_acceleration = hardware_acceleration;
+  connection_info_.video_codec = codec;
+  connection_info_.turn_mode = turn_mode;
+  if (desktop_realtime_rate_control.has_value())
+    connection_info_.desktop_realtime_rate_control = *desktop_realtime_rate_control;
+  return 0;
+}
+
+int PeerConnection::ExchangeSignal(MiniRtcSignalExchangeStage stage, const std::string& message) {
+  if (!on_signal_exchange_) return 0;
+  std::array<char, 8192> response{};
+  int size = -1;
+  try {
+    size = on_signal_exchange_(stage, message.data(), message.size(),
+                               response.data(), response.size(), user_data_);
+  } catch (...) {
+    LOG_ERROR("Signaling protocol adapter failed");
+  }
+  if (size == 0) return 0;
+  if (size > 0 && static_cast<size_t>(size) <= response.size()) {
+    const auto payload = json::parse(response.data(), response.data() + size, nullptr, false);
+    if (payload.is_object() && payload.contains("type") && payload["type"].is_string() &&
+        SendSignalMessage(response.data(), size) == 0) return 1;
+  }
+  reconnect_login_.Clear();
+  {
+    std::lock_guard lock(signal_status_mutex_);
+    signal_status_ = MiniRtcSignalStatus::MiniRtcSignalFailed;
+    pending_join_transmission_id_.reset();
+  }
+  on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalFailed, user_id_.data(), user_id_.size(), user_data_);
+  return -1;
+}
+
+int PeerConnection::Login() {
+  if (WsStatus::WsOpened != ws_status_) {
+    LOG_ERROR("Websocket not opened");
+    return -1;
+  }
+
+  int ret = 0;
+
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  json message = on_signal_exchange_
+      ? json{{"type", "login"}, {"user_id", user_id_with_pwd_}}
+      : reconnect_login_.Request(user_id_with_pwd_, now);
+  if (announcements_) announcements_->PrepareLogin(message, uri_, user_id_);
+  message["session_resume_version"] = 1;
+  message["ice_config_version"] = 1;
+  legacy_turn_config_.reset();
+  per_connection_ice_config_ = false;
+
+#ifndef NDEBUG
+  if (ws_transport_) ws_transport_->TraceSignal("login_requested");
+#endif
+  const int exchange = ExchangeSignal(MiniRtcSignalExchangeStage::PrepareLogin, message.dump());
+  if (exchange != 0) return exchange > 0 ? 0 : -1;
+
+  if (ws_transport_) {
+    ws_transport_->Send(message.dump());
+    LOG_INFO("Sending login request to signal server");
+  }
+  return ret;
+}
+
+int PeerConnection::SendJoinRequestLocked(
+    const std::string& transmission_id) {
+  offer_peer_ = false;
+  leave_ = false;
+
+  json message = {{"type", "join_transmission"},
+                  {"user_id", user_id_},
+                  {"transmission_id", transmission_id}};
+  remote_transmission_id_ = transmission_id;
+
+  if (ws_transport_) {
+    ws_transport_->Send(message.dump());
+#ifndef NDEBUG
+    ws_transport_->TraceSignal("join_submitted");
+#endif
+    LOG_INFO("Sending join transmission request");
+    LOG_DEBUG("[{}] Join transmission [{}]", user_id_,
+              transmission_id.substr(0, transmission_id.find('@')));
+  }
+
+  return 0;
+}
+
+void PeerConnection::SetSignalStatus(MiniRtcSignalStatus signal_status) {
+  std::lock_guard<std::mutex> lock(signal_status_mutex_);
+  signal_status_ = signal_status;
+}
+
+int PeerConnection::Join(const std::string& transmission_id) {
+  std::lock_guard<std::mutex> lock(signal_status_mutex_);
+  if (MiniRtcSignalStatus::MiniRtcSignalConnected == signal_status_) {
+    return SendJoinRequestLocked(transmission_id);
+  }
+
+  if (signal_status_ == MiniRtcSignalStatus::MiniRtcSignalConnecting ||
+      signal_status_ == MiniRtcSignalStatus::MiniRtcSignalReconnecting) {
+    pending_join_transmission_id_ = transmission_id;
+    leave_ = false;
+#ifndef NDEBUG
+    if (ws_transport_) ws_transport_->TraceSignal("join_waiting_for_login");
+#endif
+    LOG_INFO("Queue join transmission until signal login completes");
+    return 0;
+  }
+
+  LOG_ERROR("Signal server not connected, status = [{}]",
+            SignalStatusToString(signal_status_));
+  return -1;
+}
+
+int PeerConnection::Leave(const std::string& transmission_id) {
+  bool cancelled_pending_join = false;
+  MiniRtcSignalStatus signal_status;
+  {
+    std::lock_guard<std::mutex> lock(signal_status_mutex_);
+    signal_status = signal_status_;
+    if (pending_join_transmission_id_) {
+      LOG_INFO("Cancel queued join transmission");
+      pending_join_transmission_id_.reset();
+      cancelled_pending_join = true;
+    } else if (MiniRtcSignalStatus::MiniRtcSignalConnected == signal_status_) {
+      json message = {{"type", "user_leave_transmission"},
+                      {"user_id", user_id_},
+                      {"transmission_id", transmission_id}};
+      if (ws_transport_) {
+        ws_transport_->Send(message.dump());
+        LOG_INFO("Leave transmission notification queued");
+      }
+    }
+    leave_ = true;
+  }
+
+  if (!cancelled_pending_join &&
+      MiniRtcSignalStatus::MiniRtcSignalConnected != signal_status) {
+    if (signal_status == MiniRtcSignalStatus::MiniRtcSignalConnecting ||
+        signal_status == MiniRtcSignalStatus::MiniRtcSignalReconnecting) {
+      LOG_WARN("Signal not ready for leave yet, status=[{}]",
+               SignalStatusToString(signal_status));
+    } else {
+      LOG_ERROR("Signal not connected, status=[{}]",
+                SignalStatusToString(signal_status));
+    }
+    return -1;
+  }
+
+  ClearPeerConnections("leave transmission");
+
+  return 0;
+}
+
+int PeerConnection::DisconnectPeer(const std::string& transmission_id,
+                                    const std::string& remote_user_id) {
+  if (transmission_id.empty() || remote_user_id.empty() ||
+      remote_user_id == user_id_) {
+    return -1;
+  }
+
+  std::shared_ptr<ConnectionInterface> connection;
+  int result = -1;
+  {
+    std::shared_lock lock(peer_connection_map_mutex_);
+    const auto it = peer_connection_map_.find(remote_user_id);
+    if (it == peer_connection_map_.end()) return -1;
+    connection = it->second;
+    if (ws_transport_ && ws_transport_->GetStatus() == WsStatus::WsOpened) {
+      // Queue this before retirement reports the session as no longer alive.
+      // A separate message type prevents older servers from interpreting a
+      // selective disconnect as the host leaving its entire transmission.
+      const json message = {{"type", "disconnect_peer"},
+                            {"user_id", user_id_},
+                            {"transmission_id", transmission_id},
+                            {"remote_user_id", remote_user_id}};
+      ws_transport_->Send(message.dump());
+      result = 0;
+    }
+  }
+  if (RetirePeerConnection(remote_user_id, connection,
+                           MiniRtcConnectionStatus::MiniRtcConnectionClosed) && on_connection_status_) {
+    on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionClosed, remote_user_id.data(),
+                          remote_user_id.size(), user_data_);
+  }
+  return result;
+}
+
+int PeerConnection::AddVideoStream(const char* stream_id) {
+  LOG_DEBUG("Add video stream [{}]", stream_id);
+  media_stream_ids_.video.push_back(stream_id);
+  return 0;
+}
+
+int PeerConnection::AddAudioStream(const char* stream_id) {
+  LOG_DEBUG("Add audio stream [{}]", stream_id);
+  media_stream_ids_.audio.push_back(stream_id);
+  return 0;
+}
+
+int PeerConnection::AddDataStream(const char* stream_id, bool reliable) {
+  LOG_DEBUG("Add data stream [{}] reliable: {}", stream_id, reliable);
+  media_stream_ids_.data.insert(std::make_pair(stream_id, reliable));
+  return 0;
+}
+
+int PeerConnection::Destroy() {
+  {
+    std::lock_guard<std::mutex> lock(signal_status_mutex_);
+    pending_join_transmission_id_.reset();
+    leave_ = true;
+  }
+  ClearPeerConnections("destroy peer connection");
+  StopIceWorker();
+  if (ws_transport_) {
+    LOG_INFO("Close websocket");
+    ws_transport_->Close();
+  }
+
+  return 0;
+}
+
+MiniRtcSignalStatus PeerConnection::GetSignalStatus() {
+  std::lock_guard<std::mutex> l(signal_status_mutex_);
+  return signal_status_;
+}
+
+bool PeerConnection::IsTerminalConnectionStatus(MiniRtcConnectionStatus status) const {
+  return status == MiniRtcConnectionStatus::MiniRtcConnectionDisconnected ||
+         status == MiniRtcConnectionStatus::MiniRtcConnectionFailed ||
+         status == MiniRtcConnectionStatus::MiniRtcConnectionClosed;
+}
+
+std::shared_ptr<ConnectionInterface>
+PeerConnection::CreateManagedPeerConnection(const std::string& remote_user_id,
+                                            const ConnectionInfo& info) {
+  auto weak_connection = std::make_shared<std::weak_ptr<ConnectionInterface>>();
+  ConnectionCallbacks callbacks = connection_callbacks_;
+  if (!info.route_generation.empty()) {
+    callbacks.on_selected_route =
+        [this, remote_user_id, weak_connection, tx = info.transmission_id,
+         generation = info.route_generation](bool relay) {
+          std::unique_lock lock(peer_connection_map_mutex_);
+          const auto current = peer_connection_map_.find(remote_user_id);
+          if (current == peer_connection_map_.end() ||
+              current->second != weak_connection->lock()) return;
+          auto& report = session_routes_[remote_user_id];
+          const char* route = relay ? "relay" : "direct";
+          if (!report.is_null() && report.at("route") == route) return;
+          report = {{"type", "session_route"}, {"transmission_id", tx},
+                    {"remote_user_id", remote_user_id}, {"route_generation", generation},
+                    {"route", route}};
+          signal_sender_->Send(report.dump());
+        };
+  }
+  callbacks.on_connection_status = [this, remote_user_id, weak_connection](
+                                       MiniRtcConnectionStatus status,
+                                       const char* peer_id, size_t peer_id_size,
+                                       void* user_data) {
+    auto connection = weak_connection->lock();
+    if (!connection) {
+      return;
+    }
+
+    if (direct_ && IsTerminalConnectionStatus(status) &&
+        direct_terminal_reported_.exchange(true))
+      return;
+    if (direct_ && !IsTerminalConnectionStatus(status) && direct_closing_)
+      return;
+    if (IsTerminalConnectionStatus(status)) {
+      // Retiring first serializes terminal transport callbacks against an
+      // explicit leave or a bulk clear. The ICE worker owns an extra strong
+      // reference and shuts the transport down before releasing it, so a
+      // libnice callback can never destroy and join its own worker thread.
+      if (!RetirePeerConnection(remote_user_id, connection, status)) {
+        return;
+      }
+      if (on_connection_status_) {
+        on_connection_status_(status, peer_id, peer_id_size, user_data);
+      }
+      return;
+    }
+
+    if (!IsCurrentPeerConnection(remote_user_id, connection)) {
+      // A managed connection can be removed before its transport finishes
+      // shutting down. Ignore those late callbacks so callers observe one
+      // authoritative terminal transition for that connection generation.
+      return;
+    }
+
+    if (status == MiniRtcConnectionStatus::MiniRtcConnectionConnected) {
+      {
+        std::unique_lock lock(peer_connection_map_mutex_);
+        connected_peers_.insert(remote_user_id);
+      }
+      ReportSessions();
+    }
+    if (on_connection_status_) {
+      on_connection_status_(status, peer_id, peer_id_size, user_data);
+    }
+  };
+
+  std::shared_ptr<ConnectionInterface> connection;
+  if (direct_ || remote_user_id.find("web") == std::string::npos) {
+    connection = std::make_shared<MiniRtcConnection>(
+        clock_, signal_sender_, info, media_stream_ids_, callbacks);
+  } else {
+    connection = std::make_shared<DataChannelConnection>(
+        clock_, signal_sender_, info, media_stream_ids_, callbacks);
+  }
+
+  *weak_connection = connection;
+  return connection;
+}
+
+bool PeerConnection::RetirePeerConnection(
+    const std::string& remote_user_id,
+    const std::shared_ptr<ConnectionInterface>& connection,
+    MiniRtcConnectionStatus status) {
+  std::unique_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_user_id);
+  if (it != peer_connection_map_.end() && it->second == connection) {
+    {
+      // Queue the strong reference before erasing the map entry. Destroy()
+      // clears the map before stopping the worker, so this lock ordering also
+      // prevents a terminal callback from enqueueing after the worker exits.
+      std::lock_guard<std::mutex> work_lock(ice_work_mutex_);
+      if (!ice_worker_running_.load()) {
+        return false;
+      }
+      terminal_connection_cleanup_queue_.push(connection);
+    }
+    peer_connection_map_.erase(it);
+    connected_peers_.erase(remote_user_id);
+    session_routes_.erase(remote_user_id);
+    auto ticket = session_tickets_.find(remote_user_id);
+    if (ticket != session_tickets_.end()) {
+      auto report = ticket->second;
+      report["type"] = "session_report"; report["alive"] = false;
+      if (ws_transport_ && ws_transport_->GetStatus() == WsStatus::WsOpened)
+        ws_transport_->Send(report.dump());
+      session_tickets_.erase(ticket);
+    }
+    LOG_INFO("Retire peer connection after status [{}]",
+             ConnectionStatusToString(status));
+    ice_work_cv_.notify_one();
+    return true;
+  }
+  return false;
+}
+
+bool PeerConnection::IsCurrentPeerConnection(
+    const std::string& remote_user_id,
+    const std::shared_ptr<ConnectionInterface>& connection) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_user_id);
+  return it != peer_connection_map_.end() && it->second == connection;
+}
+
+std::shared_ptr<ConnectionInterface>
+PeerConnection::ReplaceOrCreatePeerConnection(const std::string& remote_user_id,
+                                              const char* context,
+                                              const ConnectionInfo& info) {
+  std::shared_ptr<ConnectionInterface> replaced;
+  std::shared_ptr<ConnectionInterface> connection;
+  {
+    std::unique_lock lock(peer_connection_map_mutex_);
+    auto it = peer_connection_map_.find(remote_user_id);
+    if (it != peer_connection_map_.end()) {
+      replaced = it->second;
+      peer_connection_map_.erase(it);
+      LOG_WARN("Replace existing peer connection on {}", context);
+    }
+    connected_peers_.erase(remote_user_id);
+    session_routes_.erase(remote_user_id);
+
+    connection = CreateManagedPeerConnection(remote_user_id, info);
+    peer_connection_map_.emplace(remote_user_id, connection);
+  }
+
+  if (replaced) {
+    replaced->ReleaseAllIceTransmission();
+  }
+
+  if (connection && connection->Init() != 0) {
+    if (RetirePeerConnection(remote_user_id, connection,
+                             MiniRtcConnectionStatus::MiniRtcConnectionFailed) &&
+        on_connection_status_) {
+      on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionFailed, remote_user_id.data(),
+                            remote_user_id.size(), user_data_);
+    }
+    return nullptr;
+  }
+
+  return connection;
+}
+
+void PeerConnection::ClearPeerConnections(const char* reason) {
+  std::vector<std::pair<std::string, std::shared_ptr<ConnectionInterface>>>
+      connections;
+  {
+    std::unique_lock lock(peer_connection_map_mutex_);
+    for (auto& [remote_user_id, connection] : peer_connection_map_) {
+      if (connection) {
+        connections.emplace_back(remote_user_id, connection);
+      }
+    }
+    peer_connection_map_.clear();
+    connected_peers_.clear();
+    session_tickets_.clear();
+    session_routes_.clear();
+  }
+
+  if (connections.empty()) {
+    return;
+  }
+
+  LOG_INFO("Clear [{}] peer connection(s), reason=[{}]", connections.size(),
+           reason);
+  for (auto& [remote_user_id, connection] : connections) {
+    if (on_connection_status_ &&
+        (!direct_ || !direct_terminal_reported_.exchange(true))) {
+      on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionClosed, remote_user_id.data(),
+                            remote_user_id.size(), user_data_);
+    }
+    connection->ReleaseAllIceTransmission();
+  }
+}
+
+void PeerConnection::ReportSessions(bool replay_routes) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  if (!ws_transport_ || ws_transport_->GetStatus() != WsStatus::WsOpened) return;
+  for (const auto& pair : session_tickets_) {
+    if (!connected_peers_.count(pair.first)) continue;
+    auto report = pair.second;
+    report["type"] = "session_report";
+    report["alive"] = true;
+    auto route = session_routes_.find(pair.first);
+    if (replay_routes && route != session_routes_.end()) {
+      report["route"] = route->second.at("route");
+      report["route_generation"] = route->second.at("route_generation");
+    }
+    ws_transport_->Send(report.dump());
+  }
+  if (replay_routes) {
+    for (const auto& [peer, route] : session_routes_)
+      if (!session_tickets_.count(peer)) ws_transport_->Send(route.dump());
+  }
+}
+
+int PeerConnection::SendVideoFrame(const MiniRtcVideoFrame* video_frame,
+                                   const char* stream_id) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second) {
+      peer_connection.second->SendVideoFrame(video_frame, stream_id);
+    }
+  }
+
+  return 0;
+}
+
+int PeerConnection::RequestVideoKeyFrame(const char* stream_id) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  int ret = -1;
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second &&
+        peer_connection.second->RequestVideoKeyFrame(stream_id) == 0) {
+      ret = 0;
+    }
+  }
+
+  return ret;
+}
+
+int PeerConnection::UpdateVideoBitrateLimit(const std::string& remote_id,
+                                           int max_bitrate_bps) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_id);
+  if (it == peer_connection_map_.end() || !it->second) return -1;
+  return it->second->UpdateVideoBitrateLimit(max_bitrate_bps);
+}
+
+int PeerConnection::SetVideoSendPaused(const std::string& remote_id, bool paused) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_id);
+  if (it == peer_connection_map_.end() || !it->second) return -1;
+  return it->second->SetVideoSendPaused(paused);
+}
+
+int PeerConnection::SetAudioSendPaused(const std::string& remote_id, bool paused) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_id);
+  if (it == peer_connection_map_.end() || !it->second) return -1;
+  return it->second->SetAudioSendPaused(paused);
+}
+
+int PeerConnection::UpdateVideoResolution(const std::string& remote_id,
+                                           int width, int height) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(remote_id);
+  if (it == peer_connection_map_.end() || !it->second) return -1;
+  return it->second->UpdateVideoResolution(width, height);
+}
+
+int PeerConnection::UpdateVideoSettings(const std::string& remote_id,
+                                        MiniRtcVideoQuality quality, int frame_rate,
+                                        MiniRtcVideoDegradationPreference preference) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  const auto it = peer_connection_map_.find(remote_id);
+  if (it == peer_connection_map_.end() || !it->second) return -1;
+  return it->second->UpdateVideoSettings(quality, frame_rate, preference);
+}
+
+int PeerConnection::RequestAllVideoKeyFrames() {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  int ret = -1;
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second &&
+        peer_connection.second->RequestAllVideoKeyFrames() == 0) {
+      ret = 0;
+    }
+  }
+
+  return ret;
+}
+
+int PeerConnection::SendAudioFrame(const MiniRtcAudioFrame* audio_frame,
+                                   const char* stream_id) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second) {
+      peer_connection.second->SendAudioFrame(audio_frame, stream_id);
+    }
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendDataFrame(const char* data, size_t size,
+                                  const char* stream_id) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second) {
+      peer_connection.second->SendDataFrame(data, size, stream_id);
+    }
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendReliableDataFrame(const char* data, size_t size,
+                                          const char* stream_id) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  for (auto& peer_connection : peer_connection_map_) {
+    if (peer_connection.second) {
+      peer_connection.second->SendReliableDataFrame(data, size, stream_id);
+    }
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendVideoFrameToPeer(const MiniRtcVideoFrame* video_frame,
+                                         const char* stream_id,
+                                         const char* remote_peer_id,
+                                         size_t remote_peer_id_size) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(
+      std::string(remote_peer_id, remote_peer_id_size));
+  if (it != peer_connection_map_.end() && it->second) {
+    it->second->SendVideoFrame(video_frame, stream_id);
+  } else {
+    LOG_WARN("SendVideoFrame failed, remote peer not found");
+    return -1;
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendAudioFrameToPeer(const MiniRtcAudioFrame* audio_frame,
+                                         const char* stream_id,
+                                         const char* remote_peer_id,
+                                         size_t remote_peer_id_size) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(
+      std::string(remote_peer_id, remote_peer_id_size));
+  if (it != peer_connection_map_.end() && it->second) {
+    it->second->SendAudioFrame(audio_frame, stream_id);
+  } else {
+    LOG_WARN("SendAudioFrame failed, remote peer not found");
+    return -1;
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendDataFrameToPeer(const char* data, size_t size,
+                                        const char* stream_id,
+                                        const char* remote_peer_id,
+                                        size_t remote_peer_id_size) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(
+      std::string(remote_peer_id, remote_peer_id_size));
+  if (it != peer_connection_map_.end() && it->second) {
+    it->second->SendDataFrame(data, size, stream_id);
+  } else {
+    LOG_WARN("SendDataFrame failed, remote peer not found");
+    return -1;
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendReliableDataFrameToPeer(const char* data, size_t size,
+                                                const char* stream_id,
+                                                const char* remote_peer_id,
+                                                size_t remote_peer_id_size) {
+  std::shared_lock lock(peer_connection_map_mutex_);
+  auto it = peer_connection_map_.find(
+      std::string(remote_peer_id, remote_peer_id_size));
+  if (it != peer_connection_map_.end() && it->second) {
+    return it->second->SendReliableDataFrame(data, size, stream_id);
+  } else {
+    LOG_WARN("SendReliableDataFrame failed, remote peer not found");
+    return -1;
+  }
+
+  return 0;
+}
+
+int PeerConnection::SendSignalMessage(const char* message, size_t size) {
+  if (!message || size == 0) {
+    LOG_ERROR("Invalid signal message");
+    return -1;
+  }
+  if (!ws_transport_ || WsStatus::WsOpened != ws_status_) {
+    LOG_ERROR("Websocket not opened");
+    return -1;
+  }
+  if (announcements_ && size <= 8192) {
+    const auto request = json::parse(message, message + size, nullptr, false);
+    json reply, wire;
+    if (announcements_->Request(request, reply, wire)) {
+      if (!wire.is_null()) ws_transport_->Send(wire.dump());
+      if (!reply.is_null() && on_signal_message_) {
+        const auto text = reply.dump();
+        on_signal_message_(text.data(), text.size(), user_data_);
+      }
+      return 0;
+    }
+  }
+  ws_transport_->Send(std::string(message, size));
+  return 0;
+}
+
+int PeerConnection::ForceSignalReconnect() {
+  if (!ws_transport_) {
+    LOG_ERROR("Websocket transport is unavailable");
+    return -1;
+  }
+  // A live WebSocket can still have a failed login. Only an authenticated
+  // signaling connection is a no-op; the transport status alone is not enough.
+  if (MiniRtcSignalStatus::MiniRtcSignalConnected == GetSignalStatus()) {
+    return 0;
+  }
+  ws_transport_->ForceReconnect();
+  return 0;
+}
+
+int64_t PeerConnection::GetSystemTimeMicros() {
+  if (clock_) {
+    return clock_->CurrentTimeUs();
+  }
+  return 0;
+}
+
+namespace {
+bool ParseLegacyTurnConfig(const json& message,
+                           IceServerConfiguration& config) {
+  if (!message.contains("turn") || !message["turn"].is_object()) return false;
+  const auto& turn = message["turn"];
+  if (!turn.contains("host") || !turn["host"].is_string() ||
+      !turn.contains("port") || !turn["port"].is_number_integer() ||
+      !turn.contains("username") || !turn["username"].is_string() ||
+      !turn.contains("password") || !turn["password"].is_string() ||
+      !ReadIceExpiry(turn, config.expires_at))
+    return false;
+  if (turn["port"] < 1 || turn["port"] > 65535) return false;
+  const auto host = turn["host"].get<std::string>();
+  IceServerEndpoint server;
+  if (!ParseIceServerUrl(
+          "turn:" + StunEndpoint{host, turn["port"].get<uint16_t>()}.ToString(),
+          server))
+    return false;
+  server.username = turn["username"].get<std::string>();
+  server.password = turn["password"].get<std::string>();
+  server.expires_at = config.expires_at;
+  if (server.username.empty() || server.username.size() > 512 ||
+      server.password.empty() || server.password.size() > 512 ||
+      server.username.find('\0') != std::string::npos ||
+      server.password.find('\0') != std::string::npos)
+    return false;
+  config.id = "legacy";
+  config.servers = {server};
+  server.tcp = true;
+  config.servers.push_back(server);
+  // Legacy signaling supplies the Coturn endpoint used for STUN as well.
+  IceServerEndpoint stun;
+  stun.host = server.host;
+  stun.port = server.port;
+  config.servers.push_back(std::move(stun));
+  return config.Fresh();
+}
+}  // namespace
+
+bool PeerConnection::ApplyTurnCredentials(const json& message) {
+  // Login/standalone updates are only a compatibility cache for old servers.
+  // New servers must supply a fresh snapshot on each join/offer.
+  if (per_connection_ice_config_) return false;
+  IceServerConfiguration config;
+  if (!ParseLegacyTurnConfig(message, config)) return false;
+  legacy_turn_config_ = std::move(config);
+  LOG_INFO("Received legacy TURN credentials, expires at [{}]",
+           legacy_turn_config_->expires_at);
+  return true;
+}
+
+bool PeerConnection::BuildConnectionInfo(const json& message,
+                                         const std::string& transmission_id,
+                                         const std::string& remote_user_id,
+                                         ConnectionInfo& info) {
+  {
+    std::lock_guard lock(connection_info_mutex_);
+    info = connection_info_;
+  }
+  info.transmission_id = transmission_id;
+  auto generation = message.find("route_generation");
+  if (generation != message.end() && generation->is_string() &&
+      generation->get_ref<const std::string&>().size() == 32)
+    info.route_generation = generation->get<std::string>();
+  info.user_id = user_id_;
+  info.remote_user_id = remote_user_id;
+  const bool modern = message.contains("ice");
+  IceServerConfiguration config;
+  if (modern) {
+    if (!ParseIceServerConfiguration(message["ice"], config)) {
+      LOG_WARN("Reject invalid or expired per-connection ICE configuration");
+      return false;
+    }
+  } else if (per_connection_ice_config_) {
+    LOG_WARN(
+        "Signaling server omitted negotiated per-connection ICE configuration");
+    return false;
+  } else if (message.contains("turn")) {
+    if (!ParseLegacyTurnConfig(message, config)) {
+      LOG_WARN("Reject invalid or expired connection TURN credentials");
+      return false;
+    }
+  } else if (legacy_turn_config_ && legacy_turn_config_->Fresh()) {
+    config = *legacy_turn_config_;
+  } else {
+    LOG_WARN("No fresh ICE configuration was supplied by signaling");
+    return false;
+  }
+  if ((info.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceUdp ||
+       info.turn_mode == MiniRtcTurnMode::MiniRtcTurnForceTcp) &&
+      std::none_of(config.servers.begin(), config.servers.end(),
+                   [&](const auto& server) {
+                     return IceTurnTransportAllowed(server, info.turn_mode);
+                   })) {
+    LOG_WARN(
+        "Per-connection ICE configuration has no relay matching forced TURN "
+        "mode");
+    return false;
+  }
+  LOG_INFO(
+      "Using per-connection ICE configuration, endpoints [{}], expires [{}]",
+      config.servers.size(), config.expires_at);
+  info.ice_config = std::move(config);
+  return true;
+}
+
+// Process signal message from signal server
+void PeerConnection::ProcessSignal(const std::string& signal) {
+  auto j = json::parse(signal);
+  std::string type = j["type"];
+  // LOG_INFO("signal type: {}", type);
+  switch (HASH_STRING_PIECE(type.c_str())) {
+    case "session_ticket"_H: {
+      bool valid = true;
+      for (const char* key : {"transmission_id", "host_id", "guest_id", "token"})
+        if (!j.contains(key) || !j[key].is_string()) valid = false;
+      if (!valid || j["token"].get<std::string>().size() != 64) break;
+      const auto host = j["host_id"].get<std::string>();
+      const auto guest = j["guest_id"].get<std::string>();
+      if (user_id_ != host && user_id_ != guest) break;
+      const auto remote = user_id_ == host ? guest : host;
+      {
+        std::unique_lock lock(peer_connection_map_mutex_);
+        session_tickets_[remote] = j;
+        connected_peers_.erase(remote);
+      }
+      // Tickets precede SDP on a new connection. Confirm after ICE connects.
+      break;
+    }
+    case "session_resumed"_H:
+      break;
+    case "login"_H: {
+      if (j["status"].get<std::string>() == "success") {
+        per_connection_ice_config_ =
+            j.contains("ice_config_version") && j["ice_config_version"] == 1;
+        ApplyTurnCredentials(j);
+        std::string user_id_with_pwd = j["user_id"].get<std::string>();
+        std::string password;
+
+        if (user_id_with_pwd.find("@") != std::string::npos) {
+          user_id_ = user_id_with_pwd.substr(0, user_id_with_pwd.find("@"));
+          password = user_id_with_pwd.substr(user_id_with_pwd.find("@") + 1);
+          user_id_with_pwd_ = user_id_with_pwd;
+        } else {
+          user_id_ = user_id_with_pwd;
+          password = "";
+        }
+
+        if (announcements_) announcements_->LoggedIn(j, uri_, user_id_);
+        if (!on_signal_exchange_) reconnect_login_.Accepted(j, user_id_with_pwd_,
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        MiniRtcNetTrafficStats net_traffic_stats{};
+
+#ifndef NDEBUG
+        if (ws_transport_) ws_transport_->TraceSignal("login_accepted");
+#endif
+        on_net_status_report_(user_id_with_pwd.data(), user_id_with_pwd.size(),
+                              MiniRtcTraversalMode::MiniRtcTraversalUnknown, &net_traffic_stats,
+                              user_id_.data(), user_id_.size(), user_data_);
+        LOG_INFO("Login successful");
+        LOG_DEBUG("Local user id: [{}]", user_id_);
+        {
+          std::lock_guard<std::mutex> lock(signal_status_mutex_);
+          signal_status_ = MiniRtcSignalStatus::MiniRtcSignalConnected;
+          if (pending_join_transmission_id_) {
+            std::string transmission_id =
+                std::move(*pending_join_transmission_id_);
+            pending_join_transmission_id_.reset();
+            SendJoinRequestLocked(transmission_id);
+          }
+        }
+        on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalConnected, user_id_.data(),
+                          user_id_.size(), user_data_);
+        ReportSessions(true);
+      } else if (j["status"].get<std::string>() == "fail") {
+        if (!on_signal_exchange_ && reconnect_login_.RetryPassword()) {
+          LOG_INFO("Reconnect credential rejected; retrying password login");
+          Login();
+          break;
+        }
+        LOG_WARN("Login failed");
+        {
+          std::lock_guard<std::mutex> lock(signal_status_mutex_);
+          signal_status_ = MiniRtcSignalStatus::MiniRtcSignalFailed;
+          pending_join_transmission_id_.reset();
+        }
+        on_signal_status_(MiniRtcSignalStatus::MiniRtcSignalFailed, user_id_.data(),
+                          user_id_.size(), user_data_);
+      }
+      break;
+    }
+    case "transmission_id"_H: {
+      if (j["status"].get<std::string>() == "success") {
+        local_transmission_id_ = j["transmission_id"].get<std::string>();
+        user_id_ = local_transmission_id_;
+        LOG_INFO("Create transmission successful");
+      } else if (j["status"].get<std::string>() == "fail") {
+        LOG_WARN("Create transmission failed");
+      }
+      break;
+    }
+    case "user_join_transmission"_H: {
+      std::string transmission_id = j["transmission_id"].get<std::string>();
+      std::string status = j["status"].get<std::string>();
+      if (status == "failed") {
+        LOG_ERROR("Join transmission failed: status={}",
+                  ConnectionStatusToString(ParseJoinFailure(j).status));
+        // Expose structured rejection details before the status notification,
+        // without extending the callback ABI used by existing applications.
+        if (on_signal_message_) {
+          on_signal_message_(signal.data(), signal.size(), user_data_);
+        }
+        on_connection_status_(ParseJoinFailure(j).status, transmission_id.data(),
+                              transmission_id.size(), user_data_);
+      } else {
+        std::string remote_user_id = j["user_id"].get<std::string>();
+
+        if (remote_user_id.empty()) {
+          LOG_ERROR(
+              "Invalid remote user join transmission msg without user id");
+          break;
+        }
+
+        if (remote_user_id == user_id_) {
+          break;
+        }
+
+        ConnectionInfo info;
+        if (!BuildConnectionInfo(j, transmission_id, remote_user_id, info)) {
+          on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionFailed, remote_user_id.data(),
+                                remote_user_id.size(), user_data_);
+          break;
+        }
+        if (!ReplaceOrCreatePeerConnection(remote_user_id, "join", info)) break;
+
+        IceWorkMsg msg;
+        msg.type = IceWorkMsg::Type::UserJoinTransmission;
+        msg.transmission_id = transmission_id;
+        msg.remote_user_id = remote_user_id;
+        PushIceWorkMsg(msg);
+      }
+
+      break;
+    }
+    case "user_leave_transmission"_H: {
+      std::string remote_user_id = j["user_id"];
+      IceWorkMsg msg;
+      msg.type = IceWorkMsg::Type::UserLeaveTransmission;
+      msg.remote_user_id = remote_user_id;
+      PushIceWorkMsg(msg);
+
+      break;
+    }
+    case "offer"_H: {
+      std::string transmission_id = j["transmission_id"].get<std::string>();
+      std::string remote_user_id = j["remote_user_id"].get<std::string>();
+      remote_user_id_ = remote_user_id;
+
+      if (j.contains("sdp")) {
+        std::string remote_sdp = j["sdp"].get<std::string>();
+#ifndef NDEBUG
+        if (ws_transport_) ws_transport_->TraceSignal("offer_received");
+#endif
+        LOG_INFO("Received remote offer");
+
+        if (remote_user_id.empty()) {
+          LOG_ERROR("Invalid offer msg without remote user id");
+          break;
+        }
+
+        ConnectionInfo info;
+        if (!BuildConnectionInfo(j, transmission_id, remote_user_id, info)) {
+          on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionFailed, remote_user_id.data(),
+                                remote_user_id.size(), user_data_);
+          break;
+        }
+        if (!ReplaceOrCreatePeerConnection(remote_user_id, "offer", info))
+          break;
+
+        IceWorkMsg msg;
+        msg.type = IceWorkMsg::Type::Offer;
+        msg.transmission_id = transmission_id;
+        msg.remote_user_id = remote_user_id;
+        msg.remote_sdp = remote_sdp;
+        PushIceWorkMsg(msg);
+        on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionConnecting,
+                              remote_user_id.data(), remote_user_id.size(),
+                              user_data_);
+      } else {
+        LOG_ERROR("Invalid offer msg");
+      }
+
+      break;
+    }
+    case "answer"_H: {
+      std::string transmission_id = j["transmission_id"].get<std::string>();
+      std::string remote_user_id = j["remote_user_id"].get<std::string>();
+      remote_user_id_ = remote_user_id;
+
+      if (j.contains("sdp")) {
+        std::string remote_sdp = j["sdp"].get<std::string>();
+        LOG_INFO("Received remote answer");
+
+        IceWorkMsg msg;
+        msg.type = IceWorkMsg::Type::Answer;
+        msg.transmission_id = transmission_id;
+        msg.remote_user_id = remote_user_id;
+        msg.remote_sdp = remote_sdp;
+        PushIceWorkMsg(msg);
+        on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionConnecting,
+                              remote_user_id.data(), remote_user_id.size(),
+                              user_data_);
+      } else {
+        LOG_ERROR("Invalid answer msg");
+      }
+
+      break;
+    }
+    case "new_candidate"_H: {
+      if (!j.contains("transmission_id") || !j["transmission_id"].is_string() ||
+          !j.contains("remote_user_id") || !j["remote_user_id"].is_string() ||
+          !j.contains("sdp") || !j["sdp"].is_string()) {
+        LOG_WARN("Reject candidate with missing or invalid required fields");
+        break;
+      }
+      if (j.contains("ufrag") && !j["ufrag"].is_string()) {
+        LOG_WARN("Reject candidate with invalid ICE username fragment");
+        break;
+      }
+      std::string transmission_id = j["transmission_id"].get<std::string>();
+      std::string new_candidate = j["sdp"].get<std::string>();
+      std::string remote_user_id = j["remote_user_id"].get<std::string>();
+      const auto candidate =
+          ParseIceCandidateSignal(new_candidate, j.value("ufrag", ""));
+      if (!candidate) {
+        LOG_WARN("Reject malformed ICE candidate before queueing");
+        break;
+      }
+
+      IceWorkMsg msg;
+      msg.type = IceWorkMsg::Type::NewCandidate;
+      msg.transmission_id = transmission_id;
+      msg.remote_user_id = remote_user_id;
+      msg.new_candidate = candidate->sdp;
+      msg.candidate_ufrag = candidate->ufrag;
+      PushIceWorkMsg(msg);
+
+      break;
+    }
+    case "new_candidate_mid"_H: {
+      if (!j.contains("transmission_id") || !j["transmission_id"].is_string() ||
+          !j.contains("remote_user_id") || !j["remote_user_id"].is_string() ||
+          !j.contains("candidate") || !j["candidate"].is_string() ||
+          !j.contains("mid") || !j["mid"].is_string()) {
+        LOG_WARN("Reject candidate with missing or invalid required fields");
+        break;
+      }
+      if (j.contains("ufrag") && !j["ufrag"].is_string()) {
+        LOG_WARN("Reject candidate with invalid ICE username fragment");
+        break;
+      }
+      std::string transmission_id = j["transmission_id"].get<std::string>();
+      std::string remote_user_id = j["remote_user_id"].get<std::string>();
+      std::string candidate = j["candidate"].get<std::string>();
+      std::string mid = j["mid"].get<std::string>();
+      const auto parsed_candidate =
+          ParseIceCandidateSignal(candidate, j.value("ufrag", ""));
+      if (!parsed_candidate || mid.size() > 256 ||
+          mid.find('\0') != std::string::npos ||
+          mid.find_first_of(" \t\r\n") != std::string::npos) {
+        LOG_WARN("Reject malformed ICE candidate before queueing");
+        break;
+      }
+
+      IceWorkMsg msg;
+      msg.type = IceWorkMsg::Type::NewCandidateMid;
+      msg.transmission_id = transmission_id;
+      msg.remote_user_id = remote_user_id;
+      msg.candidate = parsed_candidate->sdp;
+      msg.candidate_ufrag = parsed_candidate->ufrag;
+      msg.mid = mid;
+      PushIceWorkMsg(msg);
+
+      break;
+    }
+    case "turn_credentials"_H: {
+      if (j.value("status", "fail") == "success") {
+        ApplyTurnCredentials(j);
+      } else {
+        LOG_WARN("Failed to refresh dynamic TURN credentials");
+      }
+      break;
+    }
+    default: {
+      break;
+    }
+  }
+}
+
+void PeerConnection::StartIceWorker() {
+  ice_worker_running_ = true;
+  ice_worker_ = std::thread([this]() {
+    while (true) {
+      std::shared_ptr<ConnectionInterface> connection_to_cleanup;
+      IceWorkMsg msg{};
+      bool has_msg = false;
+
+      std::unique_lock<std::mutex> lck(ice_work_mutex_);
+      ice_work_cv_.wait(lck, [this] {
+        return !terminal_connection_cleanup_queue_.empty() ||
+               !ice_work_msg_queue_.empty() || !ice_worker_running_;
+      });
+
+      // Terminal cleanup has priority, including while the worker is being
+      // stopped. ReleaseAllIceTransmission() joins the transport thread
+      // before this worker drops the final shared_ptr.
+      if (!terminal_connection_cleanup_queue_.empty()) {
+        connection_to_cleanup =
+            std::move(terminal_connection_cleanup_queue_.front());
+        terminal_connection_cleanup_queue_.pop();
+      } else if (!ice_worker_running_) {
+        break;
+      } else {
+        msg = std::move(ice_work_msg_queue_.front());
+        ice_work_msg_queue_.pop();
+        has_msg = true;
+      }
+
+      lck.unlock();
+
+      try {
+        if (connection_to_cleanup) {
+          connection_to_cleanup->ReleaseAllIceTransmission();
+        } else if (has_msg) {
+          ProcessIceWorkMsg(msg);
+        }
+      } catch (const std::exception& error) {
+        // Connection task failures are retired below. Also contain exceptions
+        // from cleanup and application status callbacks at the thread boundary.
+        LOG_ERROR("ICE worker task failed");
+        LOG_DEBUG("ICE worker exception: {}", error.what());
+      } catch (...) {
+        LOG_ERROR("ICE worker task failed with an unknown exception");
+      }
+    }
+
+    std::lock_guard<std::mutex> lck(ice_work_mutex_);
+    std::queue<IceWorkMsg> empty_queue;
+    std::swap(ice_work_msg_queue_, empty_queue);
+  });
+}
+
+void PeerConnection::StopIceWorker() {
+  {
+    std::lock_guard<std::mutex> lck(ice_work_mutex_);
+    ice_worker_running_ = false;
+  }
+  ice_work_cv_.notify_one();
+  if (ice_worker_.joinable()) {
+    ice_worker_.join();
+  }
+}
+
+void PeerConnection::PushIceWorkMsg(const IceWorkMsg& msg) {
+  std::lock_guard<std::mutex> lck(ice_work_mutex_);
+  ice_work_msg_queue_.push(msg);
+  ice_work_cv_.notify_one();
+}
+
+void PeerConnection::ProcessIceWorkMsg(const IceWorkMsg& msg) {
+  if (msg.remote_user_id.empty()) {
+    return;
+  }
+
+  if (msg.type == IceWorkMsg::Type::UserLeaveTransmission) {
+    std::string remote_user_id = msg.remote_user_id;
+    std::shared_ptr<ConnectionInterface> connection;
+    {
+      std::unique_lock lock(peer_connection_map_mutex_);
+      auto it = peer_connection_map_.find(remote_user_id);
+      if (it != peer_connection_map_.end()) {
+        connection = it->second;
+        peer_connection_map_.erase(it);
+        connected_peers_.erase(remote_user_id);
+        session_routes_.erase(remote_user_id);
+        session_tickets_.erase(remote_user_id);
+      }
+    }
+    if (connection) {
+      LOG_INFO("Remove peer connection after leave transmission");
+      if (on_connection_status_) {
+        on_connection_status_(MiniRtcConnectionStatus::MiniRtcConnectionClosed, remote_user_id.data(),
+                              remote_user_id.size(), user_data_);
+      }
+      // The map entry is already gone, so any transport callback emitted by
+      // teardown is recognized as stale and suppressed by the managed
+      // callback wrapper above.
+      connection->ProcessIceWorkMsg(msg);
+    }
+  } else {
+    std::shared_ptr<ConnectionInterface> connection;
+    {
+      std::shared_lock lock(peer_connection_map_mutex_);
+      auto it = peer_connection_map_.find(msg.remote_user_id);
+      if (it != peer_connection_map_.end()) {
+        connection = it->second;
+      }
+    }
+    if (connection) {
+      try {
+        connection->ProcessIceWorkMsg(msg);
+        return;
+      } catch (const std::exception& error) {
+        LOG_ERROR("ICE connection task failed");
+        LOG_DEBUG("ICE task {} for [{}]: {}", static_cast<int>(msg.type),
+                  msg.remote_user_id, error.what());
+      } catch (...) {
+        LOG_ERROR("ICE connection task failed with an unknown exception");
+      }
+
+      // Retire only the failed generation. Queue teardown on this worker so
+      // partial initialization cannot leave an unusable peer in the map, and
+      // late transport callbacks cannot report a second terminal transition.
+      const auto status = MiniRtcConnectionStatus::MiniRtcConnectionFailed;
+      if (RetirePeerConnection(msg.remote_user_id, connection, status) &&
+          (!direct_ || !direct_terminal_reported_.exchange(true)) &&
+          on_connection_status_) {
+        on_connection_status_(status, msg.remote_user_id.data(),
+                              msg.remote_user_id.size(), user_data_);
+      }
+    }
+  }
+}
+}  // namespace minirtc

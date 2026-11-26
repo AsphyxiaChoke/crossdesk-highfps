@@ -1,0 +1,675 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-02-11
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _ICE_TRANSPORT_CONTROLLER_H_
+#define _ICE_TRANSPORT_CONTROLLER_H_
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "api/clock/clock.h"
+#include "api/transport/network_types.h"
+#include "api/units/timestamp.h"
+#include "audio_channel_receive.h"
+#include "audio_channel_send.h"
+#include "audio_decoder.h"
+#include "audio_encoder.h"
+#include "bitrate_prober.h"
+#include "clock/system_clock.h"
+#include "congestion_control.h"
+#include "congestion_control_feedback.h"
+#include "data_channel_receive.h"
+#include "data_channel_send.h"
+#include "encoder_input_timing.h"
+#include "ice_agent.h"
+#include "media_channel.h"
+#include "media_codec.h"
+#include "paced_sender.h"
+#include "srtp_engine.h"
+#include "task_queue.h"
+#include "task_queue_lock_free.h"
+#include "transport_feedback_adapter.h"
+#include "video_channel_receive.h"
+#include "video_channel_send.h"
+#include "video_decoder_factory.h"
+#include "video_encoder_factory.h"
+#include "video_encoder_rate_control.h"
+#include "video_frame_cadence.h"
+#include "video_send_diagnostics.h"
+
+typedef void (*OnReceiveVideo)(const MiniRtcVideoFrame*, const char*, const size_t,
+                               const char*, const size_t, void*);
+typedef void (*OnReceiveAudio)(const char*, size_t, const char*, const size_t,
+                               const char*, const size_t, void*);
+typedef void (*OnReceiveData)(const char*, size_t, const char*, const size_t,
+                              const char*, const size_t, void*);
+
+namespace minirtc {
+class ResolutionAdapter;
+
+class IceTransportController
+    : public std::enable_shared_from_this<IceTransportController>,
+      public ThreadBase {
+ public:
+  IceTransportController(std::shared_ptr<SystemClock> clock,
+                         std::shared_ptr<IceAgent> ice_agent,
+                         std::shared_ptr<IOStatistics> ice_io_statistics,
+                         bool enable_srtp, MiniRtcVideoQuality video_quality,
+                         int video_frame_rate,
+                         MiniRtcVideoContentType video_content_type,
+                         MiniRtcVideoDegradationPreference
+                             video_degradation_preference,
+                         StartingBitrates starting_bitrates = {},
+                         bool disable_receiver_padding_probing = false,
+                         bool desktop_realtime_rate_control = true);
+  ~IceTransportController();
+
+ public:
+  void Create(bool offer_peer, std::string remote_user_id,
+              rtp::PAYLOAD_TYPE video_codec_payload_type,
+              bool video_rtx_enabled, bool hardware_acceleration,
+              bool native_video_output,
+              std::optional<uint8_t> video_abs_send_time_ext_id,
+              std::optional<uint8_t> video_abs_recv_time_ext_id,
+              std::optional<uint8_t> audio_abs_send_time_ext_id,
+              std::optional<uint8_t> audio_abs_recv_time_ext_id,
+              OnReceiveVideo on_receive_video, OnReceiveAudio on_receive_audio,
+              OnReceiveData on_receive_data, void* user_data,
+              MiniRtcOnReceiveEncodedVideo encoded = nullptr);
+  void Destroy();
+
+  // SRTP is negotiated from the local setting and the remote SDP before
+  // Create() starts the media pipelines. Keep the controller in sync when the
+  // remote peer does not advertise a DTLS fingerprint.
+  void SetFecEnabled(bool video, bool audio) {
+    video_fec_enabled_ = video;
+    media_config_.audio_fec_enabled = audio;
+  }
+  void SetSrtpEnabled(bool enable_srtp) { enable_srtp_ = enable_srtp; }
+  void SetAudioDataSrtpEnabled(bool enabled) {
+    audio_data_srtp_enabled_ = enable_srtp_ && enabled;
+  }
+  // Internal runtime override; public MiniRtcParams ABI remains unchanged.
+  void SetFecMode(FecMode mode) { fec_mode_.store(mode); }
+  // DTLS readiness is published only after the SRTP sessions are installed.
+  bool IsSrtpActive() const { return dtls_ready_.load(); }
+  void PopulateVideoCodecStats(MiniRtcNetTrafficStats& stats);
+
+  uint32_t AddVideoSendChannel(const std::string& channel_name);
+  uint32_t GetVideoRtxSsrc(const std::string& channel_name);
+  uint32_t AddAudioSendChannel(const std::string& channel_name);
+  uint32_t AddDataSendChannel(const std::string& channel_name, bool reliable);
+
+  uint32_t AddVideoReceiveChannel(const std::string& channel_name,
+                                  uint32_t ssrc, uint32_t rtx_ssrc = 0);
+  uint32_t AddAudioReceiveChannel(const std::string& channel_name,
+                                  uint32_t ssrc);
+  uint32_t AddDataReceiveChannel(const std::string& channel_name, uint32_t ssrc,
+                                 bool reliable = false);
+
+  int SendVideo(const MiniRtcVideoFrame* video_frame,
+                const std::string& channel_name);
+  int SendAudio(const MiniRtcAudioFrame* audio_frame,
+                const std::string& channel_name);
+  int SendData(const char* data, size_t size, const std::string& channel_name);
+  int SendReliableData(const char* data, size_t size,
+                       const std::string& channel_name);
+
+  int UpdateVideoBitrateLimit(int max_bitrate_bps);
+  int SetVideoSendPaused(bool paused);
+  int SetAudioSendPaused(bool paused);
+  int UpdateVideoResolution(int width, int height);
+  int UpdateVideoSettings(MiniRtcVideoQuality quality, int frame_rate,
+                          MiniRtcVideoDegradationPreference preference);
+
+  void FullIntraRequest();
+  void FullIntraRequest(const std::string& channel_name) {
+    if (channel_name.empty()) {
+      FullIntraRequest();
+      return;
+    }
+    std::lock_guard<std::mutex> lock(force_i_frame_streams_mutex_);
+    force_i_frame_streams_.insert(channel_name);
+  }
+  void FullIntraRequest(uint32_t media_ssrc);
+  void FullIntraRequestAllVideoStreams();
+
+  void UpdateNetworkAvaliablity(bool network_available);
+  void SetRelayPath(bool relay_path);
+
+  int DecryptIncomingPacket(uint8_t* buffer, int* size, uint32_t* out_ssrc);
+
+  int OnReceiveVideoRtpPacket(const char* data, size_t size, uint32_t ssrc);
+  int OnReceiveAudioRtpPacket(const char* data, size_t size, uint32_t ssrc);
+  int OnReceiveDataRtpPacket(const char* data, size_t size, uint32_t ssrc);
+  int OnReceiveDataAckRtpPacket(const char* data, size_t size, uint32_t ssrc,
+                                const std::string& channel_name);
+
+  void OnReceiveCompleteAudio(const char* data, size_t size,
+                              const std::string& channel_name,
+                              uint16_t sequence, uint32_t timestamp);
+  void OnReceiveCompleteData(const char* data, size_t size,
+                             const std::string& channel_name);
+
+  int OnDtlsHandshakeDone(void* user_ptr);
+
+ public:
+  void OnSenderReport(const SenderReport& sender_report);
+  void OnReceiverReport(const std::vector<RtcpReportBlock>& report_block_datas);
+  void OnTransportRtt(double rtt_ms);
+  void OnTransportClockOffset(int64_t offset_us, int64_t rtt_us);
+  void ResetTransportClockOffset();
+  void OnCongestionControlFeedback(
+      const webrtc::rtcp::CongestionControlFeedback& feedback);
+  void OnReceiveNack(uint32_t media_ssrc,
+                     const std::vector<uint16_t>& nack_sequence_numbers);
+
+ private:
+  int ProtectOutgoingPacket(const char* data, size_t size,
+                            std::vector<uint8_t>& protected_packet);
+  int PrepareUnpacedPacket(const char*& data, size_t& size,
+                           std::vector<uint8_t>& protected_packet);
+  bool InstallSrtpSessions();
+
+  int CreateCodecs(rtp::PAYLOAD_TYPE video_pt, bool hardware_acceleration);
+  int ConfigureStreamCodecs(bool hardware_acceleration, VideoCodecType codec_type);
+
+ private:
+  struct PacketFeedbackRegistration {
+    int64_t send_time_ms = 0;
+    size_t send_size = 0;  // Includes SRTP overhead when the packet is protected.
+    bool tracked = false;
+    int64_t fec_feedback_id = -1;
+    std::optional<webrtc::SentPacket> sent_packet;
+  };
+
+  PacketFeedbackRegistration RegisterPacketForFeedback(
+      const webrtc::RtpPacketToSend& packet,
+      const webrtc::PacedPacketInfo& pacing_info, size_t send_size);
+  void RollbackPacketFeedback(
+      const webrtc::RtpPacketToSend& packet,
+      const PacketFeedbackRegistration& registration);
+  void OnSentPacket(const webrtc::RtpPacketToSend& packet,
+                    const PacketFeedbackRegistration& registration,
+                    const webrtc::PacedPacketInfo& pacing_info);
+  void PostUpdates(webrtc::NetworkControlUpdate update);
+  void UpdateVideoBitrateAllocation();
+  void UpdateFecProtection();
+  void ResetFecAdaptation(bool reset_feedback = true);
+  void UpdateControlState();
+  void UpdateCongestedState();
+  bool CanProbeWithoutMedia();
+  void UpdateMediaTransportState();
+  std::optional<bool> GetCongestedStateUpdate() const;
+  void MaybeDegradeResolutionOnEncodeTime(const std::string& channel_name,
+                                          int queue_delay_ms,
+                                          const EncodedFrame& encoded_frame,
+                                          uint64_t settings_generation);
+
+ private:
+  bool Process() override;
+
+ private:
+  enum class StreamType { kAudio, kVideo, kData };
+  std::function<int(const char*, size_t)> CreateUnpacedSendFunction(
+      StreamType type);
+  enum class StreamDirection { kSend, kReceive };
+
+  // Each receive channel owns one counter. The output callback keeps its
+  // reservation alive across asynchronous decode, including drops and resets.
+  struct DecodeBacklog {
+    std::atomic<int> pending{0};
+    int64_t last_submission_ms = 0;  // Accessed only on the RTP delivery thread.
+  };
+  struct DecodeReservation {
+    explicit DecodeReservation(const std::shared_ptr<DecodeBacklog>& backlog)
+        : backlog(backlog), previously_pending(backlog->pending.fetch_add(1)) {}
+    ~DecodeReservation() { --backlog->pending; }
+    std::shared_ptr<DecodeBacklog> backlog;
+    const int previously_pending;
+  };
+  void OnReceiveCompleteFrame(std::unique_ptr<ReceivedFrame> received_frame,
+                              const std::string& channel_name,
+                              std::shared_ptr<DecodeReservation> reservation);
+
+  class StreamContext {
+   public:
+    std::string name;
+    std::optional<uint32_t> ssrc;
+    std::optional<uint32_t> rtx_ssrc;
+    StreamType type;
+    StreamDirection direction;
+
+    std::optional<int> target_width;
+    std::optional<int> target_height;
+    int source_width = 0;   // capture fitted to this peer's viewport bound
+    int source_height = 0;  // aspect-ratio anchor for further adaptation
+    std::optional<int64_t> last_active_time;
+    std::optional<int64_t> last_capture_time;
+    std::optional<int> desired_target_bitrate;
+    std::optional<int> applied_target_bitrate;
+    bool bitrate_update_queued = false;
+    VideoEncoderRateControl video_rate_control;
+    VideoSendDiagnostics video_send_diagnostics;
+    EncoderInputCadence encoder_input_cadence;
+    int applied_input_frame_rate = 0;
+    FecAdaptationController fec_controller;
+    FecProtectionConfig fec_protection;
+    int64_t fec_last_active_ms = -1;
+    bool startup_resolution_attempted = false;
+    bool startup_keyframe_pending = false;
+    int startup_keyframe_retry_count = 0;
+    int64_t startup_keyframe_started_ms = 0;
+    size_t regular_keyframe_size_budget_bytes = 0;
+    size_t keyframe_size_budget_bytes = 0;
+    bool awaiting_budget_keyframe = false;
+    int keyframe_budget_retry_count = 0;
+    int64_t discarded_keyframe_capture_us = 0;
+    bool keyframe_limited_upgrade = false;
+    int64_t keyframe_failed_pixels = 0;
+    size_t keyframe_failed_bytes = 0;
+    int64_t keyframe_failure_ms = 0;
+    bool keyframe_same_resolution_retry = false;
+    struct KeyframeResolutionRecovery {
+      int width;
+      int height;
+      int64_t expires_ms;
+      double projected_bytes = 0;
+    };
+    std::optional<KeyframeResolutionRecovery> keyframe_resolution_recovery;
+    uint64_t video_settings_generation = 0;
+    bool initial_resolution_recovery = true;
+    bool native_resolution_probe_attempted = false;
+    int encode_exceed_count = 0;
+    int encode_below_threshold_count = 0;
+    bool encoding_speed_priority_enabled = false;
+    std::optional<uint64_t> encoding_speed_priority_update_generation;
+    bool encoding_speed_priority_update_failed = false;
+    std::optional<int> mapped_target_width;
+    std::optional<int> mapped_target_height;
+    bool resolution_upgrade_network_blocked = false;
+    bool freeze_resolution = false;
+    bool static_content_candidate = false;
+    bool static_content_candidate_initialized = false;
+    int64_t static_content_candidate_since_ms = 0;
+    int64_t source_resolution_initialized_ms = 0;
+    std::optional<int> pending_mapped_width;
+    std::optional<int> pending_mapped_height;
+    int mapping_stability_count = 0;
+    int64_t pending_mapped_since_ms = 0;
+    struct BandwidthResolutionCandidate {
+      int width;
+      int height;
+      int64_t since_ms;
+    };
+    // Increasing sizes and their uninterrupted support times. Retain only
+    // the short confirmation window plus its oldest still-supported size.
+    std::deque<BandwidthResolutionCandidate> pending_mapped_candidates;
+    int64_t last_resolution_change_ms = 0;
+    bool resolution_upgrade_probe_active = false;
+    bool resolution_upgrade_probe_fast = false;
+    int resolution_upgrade_probe_base_width = 0;
+    int resolution_upgrade_probe_base_height = 0;
+    int resolution_upgrade_probe_target_width = 0;
+    int resolution_upgrade_probe_target_height = 0;
+    int resolution_upgrade_probe_sample_count = 0;
+    int64_t resolution_upgrade_probe_started_ms = 0;
+    int64_t resolution_upgrade_probe_measurement_started_ms = 0;
+    uint64_t resolution_upgrade_probe_capture_start = 0;
+    int resolution_upgrade_probe_failure_count = 0;
+    int64_t next_resolution_upgrade_probe_ms = 0;
+    int64_t encoded_frame_rate_window_started_ms = 0;
+    int encoded_frame_rate_window_frame_count = 0;
+    int measured_encoded_frame_rate = 0;
+    bool encoded_frame_rate_ready = false;
+    int64_t encoded_frame_rate_healthy_since_ms = 0;
+    std::array<int, 3> encoded_frame_rate_windows{};
+    size_t encoded_frame_rate_valid_window_count = 0;
+    std::atomic<uint64_t> capture_input_frame_total{0};
+    std::atomic<uint64_t> pacer_rejected_frame_total{0};
+    // Mutually exclusive causes, with the same stream lifetime as the total.
+    // Admission-window resets retain these cumulative counters.
+    std::atomic<uint64_t> pacer_rejected_expected_queue_only_total{0};
+    std::atomic<uint64_t> pacer_rejected_oldest_wait_only_total{0};
+    std::atomic<uint64_t> pacer_rejected_both_total{0};
+    std::atomic<uint64_t> encode_queue_dropped_frame_total{0};
+    int64_t frame_admission_window_started_ms = 0;
+    uint64_t frame_admission_window_capture_start = 0;
+    uint64_t frame_admission_window_pacer_rejected_start = 0;
+    uint64_t frame_admission_window_encode_queue_dropped_start = 0;
+    uint64_t frame_admission_capture_samples = 0;
+    uint64_t frame_admission_pacer_rejected_samples = 0;
+    uint64_t frame_admission_encode_queue_dropped_samples = 0;
+    int measured_capture_input_frame_rate = 0;
+    int measured_pacer_rejection_percent = 0;
+    int measured_encode_queue_drop_percent = 0;
+    bool frame_admission_metrics_ready = false;
+    int64_t low_capture_frame_rate_since_ms = 0;
+    int64_t high_pacer_rejection_since_ms = 0;
+    int64_t high_encode_queue_drop_since_ms = 0;
+    EncoderQualityStats last_encoder_quality_stats;
+    float normalized_qp_ewma = -1.0f;
+    std::deque<std::pair<int64_t, int>> encode_queue_delay_samples;
+    int64_t encode_queue_delay_tracking_started_ms = 0;
+    bool encode_queue_delay_window_ready = false;
+    int average_encode_queue_delay_ms = 0;
+    int p95_encode_queue_delay_ms = 0;
+
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+    // Encode-path stage timings in microseconds, sampled over the same window
+    // as the queue delay. Splitting the path is what tells a frame-budget
+    // overrun apart: the capture-side copy into RawFrame, the whole synchronous
+    // Encode() call, and (for hardware encoders that report it) the
+    // host-to-device copy and the encoder call inside it.
+    struct StageTiming {
+      std::deque<std::pair<int64_t, int64_t>> samples;
+
+      void Add(int64_t now_ms, int64_t value_us, int64_t window_ms) {
+        if (value_us < 0) return;
+        samples.emplace_back(now_ms, value_us);
+        while (!samples.empty() && samples.front().first < now_ms - window_ms) {
+          samples.pop_front();
+        }
+      }
+
+      // Compute the aggregate only when the health log is due. A stage may
+      // have stopped producing samples before the other stages.
+      std::pair<int64_t, int64_t> Summary(int64_t since_ms) const {
+        int64_t sum = 0;
+        std::vector<int64_t> values;
+        values.reserve(samples.size());
+        for (const auto& [time, value] : samples) {
+          if (time < since_ms) continue;
+          values.push_back(value);
+          sum += value;
+        }
+        if (values.empty()) return {0, 0};
+        const size_t p95 = (values.size() * 95 + 99) / 100 - 1;
+        std::nth_element(values.begin(), values.begin() + p95, values.end());
+        return {sum / static_cast<int64_t>(values.size()), values[p95]};
+      }
+    };
+    uint64_t encode_timing_generation = 0;
+    StageTiming encode_copy_timing;
+    StageTiming encode_sync_timing;
+    StageTiming encoder_upload_timing;
+    StageTiming encoder_submit_timing;
+#endif
+    int64_t encode_backlog_since_ms = 0;
+    int64_t severe_encode_backlog_since_ms = 0;
+    int64_t critical_encode_backlog_since_ms = 0;
+    int64_t post_upgrade_protection_until_ms = 0;
+    // Receive side. Inputs submitted since the decoder last delivered a frame.
+    // A decoder without a synchronization point ignores delta access units and
+    // still reports success, so this count is the only observable signal. The
+    // decode task increments it; output delivery, which may run on a decoder
+    // thread, clears it.
+    std::atomic<int> decode_inputs_without_output{0};
+    int64_t last_decode_stall_request_ms = 0;
+
+    void FinishStartupKeyframe() {
+      startup_keyframe_pending = false;
+      keyframe_size_budget_bytes = regular_keyframe_size_budget_bytes;
+    }
+
+    void ResetPendingBandwidthMapping() {
+      pending_mapped_width.reset();
+      pending_mapped_height.reset();
+      mapping_stability_count = 0;
+      pending_mapped_since_ms = 0;
+      pending_mapped_candidates.clear();
+    }
+
+    void ClearResolutionUpgradeProbe() {
+      resolution_upgrade_probe_active = false;
+      resolution_upgrade_probe_fast = false;
+      resolution_upgrade_probe_base_width = 0;
+      resolution_upgrade_probe_base_height = 0;
+      resolution_upgrade_probe_target_width = 0;
+      resolution_upgrade_probe_target_height = 0;
+      resolution_upgrade_probe_sample_count = 0;
+      resolution_upgrade_probe_started_ms = 0;
+      resolution_upgrade_probe_measurement_started_ms = 0;
+      resolution_upgrade_probe_capture_start = 0;
+    }
+
+    int BackoffResolutionUpgrade(int64_t now_ms) {
+      ClearResolutionUpgradeProbe();
+      initial_resolution_recovery = false;
+      resolution_upgrade_probe_failure_count =
+          std::min(resolution_upgrade_probe_failure_count + 1, 3);
+      const int backoff_ms = 3000 << resolution_upgrade_probe_failure_count;
+      next_resolution_upgrade_probe_ms = now_ms + backoff_ms;
+      return backoff_ms;
+    }
+
+    void ResetResolutionUpgradeProbe() {
+      ClearResolutionUpgradeProbe();
+      resolution_upgrade_probe_failure_count = 0;
+      next_resolution_upgrade_probe_ms = 0;
+    }
+
+    void RecordPacerRejection(bool expected_queue_full,
+                              bool oldest_packet_expired) {
+      if (!expected_queue_full && !oldest_packet_expired) return;
+      pacer_rejected_frame_total.fetch_add(1, std::memory_order_relaxed);
+      auto& cause = expected_queue_full && oldest_packet_expired
+                        ? pacer_rejected_both_total
+                        : (expected_queue_full
+                               ? pacer_rejected_expected_queue_only_total
+                               : pacer_rejected_oldest_wait_only_total);
+      cause.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void ResetFrameAdmissionTracking() {
+      frame_admission_window_started_ms = 0;
+      frame_admission_window_capture_start =
+          capture_input_frame_total.load(std::memory_order_acquire);
+      frame_admission_window_pacer_rejected_start =
+          pacer_rejected_frame_total.load(std::memory_order_acquire);
+      frame_admission_window_encode_queue_dropped_start =
+          encode_queue_dropped_frame_total.load(std::memory_order_acquire);
+      frame_admission_capture_samples = 0;
+      frame_admission_pacer_rejected_samples = 0;
+      frame_admission_encode_queue_dropped_samples = 0;
+      measured_capture_input_frame_rate = 0;
+      measured_pacer_rejection_percent = 0;
+      measured_encode_queue_drop_percent = 0;
+      frame_admission_metrics_ready = false;
+      low_capture_frame_rate_since_ms = 0;
+      high_pacer_rejection_since_ms = 0;
+      high_encode_queue_drop_since_ms = 0;
+    }
+
+    void ResetEncodedFrameRateTracking() {
+      encoder_input_cadence.Reset();
+      applied_input_frame_rate = 0;
+      encoded_frame_rate_window_started_ms = 0;
+      encoded_frame_rate_window_frame_count = 0;
+      measured_encoded_frame_rate = 0;
+      encoded_frame_rate_ready = false;
+      encoded_frame_rate_healthy_since_ms = 0;
+      encoded_frame_rate_windows.fill(0);
+      encoded_frame_rate_valid_window_count = 0;
+      ResetFrameAdmissionTracking();
+    }
+
+    void ResetEncoderQualityTracking() {
+      last_encoder_quality_stats = {};
+      normalized_qp_ewma = -1.0f;
+    }
+
+    void ResetEncodeQueueDelayTracking() {
+      encode_queue_delay_samples.clear();
+      encode_queue_delay_tracking_started_ms = 0;
+      encode_queue_delay_window_ready = false;
+      average_encode_queue_delay_ms = 0;
+      p95_encode_queue_delay_ms = 0;
+      encode_backlog_since_ms = 0;
+      severe_encode_backlog_since_ms = 0;
+      critical_encode_backlog_since_ms = 0;
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+      ++encode_timing_generation;
+      encode_copy_timing.samples.clear();
+      encode_sync_timing.samples.clear();
+      encoder_upload_timing.samples.clear();
+      encoder_submit_timing.samples.clear();
+#endif
+    }
+
+    std::shared_ptr<MediaChannel> transceiver;
+    int64_t next_codec_attempt_ms = 0;  // Accessed on this stream's codec queue.
+    std::shared_ptr<MediaCodec> codec;
+
+    bool reliable;
+  };
+
+  void PostVideoBitrateUpdate(
+      const std::string& channel_name,
+      const std::shared_ptr<StreamContext>& context,
+      const std::shared_ptr<MediaCodec>& codec);
+  void ApplyVideoBitrateUpdateOnEncodeQueue(
+      const std::string& channel_name,
+      const std::shared_ptr<StreamContext>& context,
+      const std::shared_ptr<MediaCodec>& codec);
+
+  std::shared_ptr<MediaCodec> CreateVideoCodec(
+      const std::shared_ptr<StreamContext>& context,
+      int encode_width = 0, int encode_height = 0);
+  bool CheckStreamContext(const std::string& channel_name,
+                          const std::shared_ptr<StreamContext>& context,
+                          StreamType expected);
+  bool PrepareStartupKeyframe(const std::shared_ptr<StreamContext>& context,
+                              int64_t frame_bitrate, bool* force_keyframe);
+  void NoteKeyframeBudgetFailure(const std::shared_ptr<StreamContext>& context,
+                                 int retry_width, int retry_height);
+  int OnVideoEncoded(const std::string& channel_name,
+                     const std::shared_ptr<StreamContext>& context,
+                     int queue_delay_ms, bool measure_encode_delay,
+                     const EncodedFrame& encoded_frame,
+                     uint64_t settings_generation);
+
+  std::map<std::string, std::shared_ptr<StreamContext>> stream_senders_;
+  std::map<std::string, std::shared_ptr<StreamContext>> stream_receivers_;
+  std::shared_mutex stream_senders_mutex_;
+  std::shared_mutex stream_receivers_mutex_;
+
+  std::map<uint32_t, std::shared_ptr<SrtpEngine::SrtpSession>>
+      ssrc_to_srtp_sender_;
+  std::map<uint32_t, std::shared_ptr<SrtpEngine::SrtpSession>>
+      ssrc_to_srtp_receiver_;
+
+  std::map<uint32_t, std::string> ssrc_to_name_;
+
+  MediaCodecConfig media_config_;
+  StartingBitrates starting_bitrates_;
+  bool disable_receiver_padding_probing_ = false;
+
+  OnReceiveVideo on_receive_video_ = nullptr;
+  MiniRtcOnReceiveEncodedVideo on_receive_encoded_video_ = nullptr;
+  OnReceiveAudio on_receive_audio_ = nullptr;
+  OnReceiveData on_receive_data_ = nullptr;
+
+ private:
+  std::shared_ptr<IceAgent> ice_agent_ = nullptr;
+  std::shared_ptr<IOStatistics> ice_io_statistics_ = nullptr;
+  std::unique_ptr<RtpPacketizer> rtp_packetizer_ = nullptr;
+  std::shared_ptr<PacedSender> paced_sender_ = nullptr;
+  std::string remote_user_id_;
+  bool offer_peer_ = false;
+  void* user_data_ = nullptr;
+  std::atomic<bool> is_running_;
+
+  bool enable_srtp_;
+  bool audio_data_srtp_enabled_ = false;
+  bool video_rtx_enabled_ = false;
+  bool video_fec_enabled_ = false;
+  std::atomic<FecMode> fec_mode_{FecMode::kAdaptive};
+  uint64_t fec_config_version_ = 0;
+  bool fec_update_queued_ = false;  // Guarded by stream_senders_mutex_.
+  int64_t rtx_bitrate_limit_bps_ = 0;  // Guarded by stream_senders_mutex_.
+  int64_t fec_snapshot_ms_ = -1, fec_log_ms_ = -1;
+  std::map<uint32_t, FecFeedbackSnapshot> fec_feedback_snapshots_;
+  std::optional<uint8_t> video_abs_send_time_ext_id_;
+  std::optional<uint8_t> video_abs_recv_time_ext_id_;
+  std::optional<uint8_t> audio_abs_send_time_ext_id_;
+  std::optional<uint8_t> audio_abs_recv_time_ext_id_;
+  std::atomic<bool> ice_ready_{false};
+  std::atomic<bool> dtls_ready_{false};
+  std::atomic<bool> media_transport_ready_{false};
+  // -1 means ICE has not selected a pair yet, 0 direct, 1 relay.
+  std::atomic<int> relay_path_state_{-1};
+  uint64_t cc_route_id_ = 0;      // Accessed only on task_queue_cc_.
+  double cwnd_reduce_ratio_ = 0;  // Protected by stream_senders_mutex_.
+  std::atomic<int64_t> video_transport_bitrate_bps_{MINIRTC_INIT_BITRATE};
+  std::optional<webrtc::NetworkEstimate> video_network_estimate_;
+  // Physical viewport bound for this peer; guarded by stream_senders_mutex_.
+  int video_resolution_width_ = 0;
+  int video_resolution_height_ = 0;
+  MiniRtcVideoQuality video_quality_;
+  bool initial_video_settings_synced_ = false;
+
+  std::vector<uint8_t> local_key_;
+  std::vector<uint8_t> local_salt_;
+  std::vector<uint8_t> remote_key_;
+  std::vector<uint8_t> remote_salt_;
+
+ private:
+  std::shared_ptr<SystemClock> clock_;
+  std::shared_ptr<webrtc::Clock> webrtc_clock_ = nullptr;
+  webrtc::TransportFeedbackAdapter transport_feedback_adapter_;
+  mutable std::mutex transport_feedback_adapter_mutex_;
+  std::unique_ptr<CongestionControl> controller_;
+  BitrateProber prober_;
+  std::shared_ptr<TaskQueue> task_queue_cc_;
+  std::shared_ptr<TaskQueue> task_queue_pacer_;
+  std::shared_ptr<TaskQueueLockFree> task_queue_encode_;
+  std::shared_ptr<TaskQueueLockFree> task_queue_decode_;
+  std::shared_ptr<TaskQueueLockFree> task_queue_trans_fb_;
+  webrtc::DataSize congestion_window_size_;
+  std::atomic<bool> is_congested_{false};
+  std::string last_active_stream_;
+
+ private:
+  std::unique_ptr<ResolutionAdapter> resolution_adapter_;
+  std::atomic<bool> b_force_i_frame_;
+  std::mutex force_i_frame_streams_mutex_;
+  std::unordered_set<std::string> force_i_frame_streams_;
+  bool video_codec_configured_;
+  bool hardware_acceleration_;
+  VideoCodecType video_codec_type_ = VideoCodecType::H264;
+  bool video_codec_hardware_ = false;
+  // Guarded by stream_senders_mutex_, separately for each display.
+  std::unordered_map<std::string, VideoFrameCadence> video_frame_cadences_;
+  // Guarded by stream_senders_mutex_; each controller owns one peer's send state.
+  bool video_send_paused_ = false;
+  bool audio_send_paused_ = false;
+  bool native_video_output_;
+
+ private:
+  std::unique_ptr<AudioEncoder> audio_encoder_ = nullptr;
+  std::unique_ptr<AudioDecoder> audio_decoder_ = nullptr;
+  std::map<std::string, std::unique_ptr<AudioEncoder>> audio_encoders_;
+  std::map<std::string, std::unique_ptr<AudioDecoder>> audio_decoders_;
+
+  bool audio_codec_inited_ = false;
+
+ private:
+  int video_bitrate_limit_bps_ = 0;  // Accessed only on the congestion queue.
+  int64_t target_bitrate_ = 0;
+  int64_t available_transport_bitrate_ = 0;
+
+};
+}  // namespace minirtc
+
+#endif

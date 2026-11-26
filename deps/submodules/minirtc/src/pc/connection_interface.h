@@ -1,0 +1,130 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-11-05
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _CONNECTION_INTERFACE_H_
+#define _CONNECTION_INTERFACE_H_
+
+#include <functional>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "direct_ice_policy.h"
+#include "bitrate_limits.h"
+#include "ice_server_config.h"
+#include "minirtc.h"
+
+namespace minirtc {
+
+struct MediaStreamIds {
+  std::vector<std::string> video;
+  std::vector<std::string> audio;
+  std::map<std::string, bool> data;
+};
+
+struct ConnectionInfo {
+  StartingBitrates starting_bitrates;
+  bool disable_receiver_padding_probing = false;
+  bool desktop_realtime_rate_control = true;
+  DirectIcePolicy direct_policy;
+  std::function<void(MiniRtcDirectError)> direct_error;
+  std::optional<IceServerConfiguration> ice_config;
+  std::string route_generation;
+  std::string transmission_id;
+  std::string user_id;
+  std::string remote_user_id;
+
+  bool hardware_acceleration;
+  bool native_video_output;
+  bool trickle_ice;
+  bool reliable_ice;
+  MiniRtcTurnMode turn_mode;
+  bool enable_srtp;
+  MiniRtcVideoContentType video_content_type;
+  MiniRtcVideoCodec video_codec = MiniRtcVideoCodec::H264;
+  MiniRtcVideoQuality video_quality;
+  int video_frame_rate;
+  MiniRtcVideoDegradationPreference video_degradation_preference;
+};
+
+inline bool ConnectionIceConfigFresh(const ConnectionInfo& info) {
+  return info.direct_policy.enabled()
+             ? IsDirectAddressPair(info.direct_policy.local_address,
+                                   info.direct_policy.remote_address)
+             : info.ice_config && info.ice_config->Fresh();
+}
+
+struct ConnectionCallbacks {
+  MiniRtcOnReceiveVideoFrame on_receive_video_frame;
+  MiniRtcOnReceiveBuffer on_receive_audio_buffer;
+  MiniRtcOnReceiveBuffer on_receive_data_buffer;
+  std::function<void(MiniRtcConnectionStatus, const char*, size_t, void*)>
+      on_connection_status;
+  MiniRtcOnNetStatusReport on_net_status_report;
+  void* user_data = nullptr;
+  MiniRtcOnReceiveEncodedVideo on_receive_encoded_video = nullptr;
+  std::function<void(bool relay)> on_selected_route;
+};
+
+struct IceWorkMsg {
+  enum Type {
+    Login = 0,
+    UserLeaveTransmission,
+    UserJoinTransmission,
+    Offer,
+    Answer,
+    NewCandidate,
+    NewCandidateMid,
+    RetryWithTurn
+  };
+
+  Type type;
+  std::vector<std::string> user_id_list;
+  std::string user_id;
+  std::string transmission_id;
+  std::string remote_user_id;
+  std::string new_candidate;
+  std::string candidate_ufrag;
+  std::string candidate;
+  std::string mid;
+  std::string remote_sdp;
+};
+
+class ConnectionInterface {
+ public:
+  ConnectionInterface() {}
+  virtual ~ConnectionInterface() {}
+
+  virtual int Init() = 0;
+
+  virtual int ReleaseAllIceTransmission() = 0;
+
+  virtual int SendVideoFrame(const MiniRtcVideoFrame* video_frame,
+                             const char* stream_id) = 0;
+  virtual int RequestVideoKeyFrame(const char* stream_id) = 0;
+  virtual int RequestAllVideoKeyFrames() = 0;
+  // Unsupported transports reject optional live settings.
+  virtual int UpdateVideoBitrateLimit(int) { return -1; }
+  virtual int SetVideoSendPaused(bool) { return -1; }
+  virtual int SetAudioSendPaused(bool) { return -1; }
+  virtual int UpdateVideoResolution(int, int) { return -1; }
+  virtual int UpdateVideoSettings(MiniRtcVideoQuality, int,
+                                  MiniRtcVideoDegradationPreference) {
+    return -1;
+  }
+  virtual int SendAudioFrame(const MiniRtcAudioFrame* audio_frame,
+                             const char* stream_id) = 0;
+  virtual int SendDataFrame(const char* data, size_t size,
+                            const char* stream_id) = 0;
+  virtual int SendReliableDataFrame(const char* data, size_t size,
+                                    const char* stream_id) = 0;
+
+  virtual void ProcessIceWorkMsg(const IceWorkMsg& msg) = 0;
+};
+}  // namespace minirtc
+
+#endif

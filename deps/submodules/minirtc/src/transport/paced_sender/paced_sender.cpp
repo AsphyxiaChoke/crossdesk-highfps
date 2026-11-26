@@ -1,0 +1,815 @@
+
+#include "paced_sender.h"
+
+#include <algorithm>
+#include <chrono>
+
+#include "log.h"
+
+namespace minirtc {
+namespace {
+
+webrtc::PacingController::Configuration LowLatencyPacingConfiguration(
+    bool bounded_video_queue) {
+  auto configuration =
+      webrtc::PacingController::DefaultConfiguration();
+  // A fresh key frame supersedes queued desktop deltas. Flushing those older
+  // packets prevents a recovery frame from sitting behind content that can no
+  // longer be decoded usefully.
+  configuration.keyframe_flushing = true;
+  // Desktop senders pause frame admission while the queue drains at the GCC
+  // pacing rate. The short admission deadline must not accelerate large frames.
+  configuration.drain_large_queues = !bounded_video_queue;
+  return configuration;
+}
+
+}  // namespace
+
+const int PacedSender::kNoPacketHoldback = -1;
+
+PacedSender::PacedSender(std::shared_ptr<IceAgent> ice_agent,
+                         std::shared_ptr<webrtc::Clock> clock,
+                         std::shared_ptr<TaskQueue> task_queue,
+                         bool bounded_video_queue,
+                         bool disable_receiver_padding_probing)
+    : ice_agent_(ice_agent),
+      pacing_controller_(clock.get(), this,
+                         LowLatencyPacingConfiguration(bounded_video_queue)),
+      clock_(clock),
+      max_hold_back_window_(webrtc::TimeDelta::Millis(5)),
+      max_hold_back_window_in_packets_(3),
+      next_process_time_(webrtc::Timestamp::MinusInfinity()),
+      is_started_(false),
+      transport_ready_(false),
+      is_shutdown_(false),
+      packet_size_(/*alpha=*/0.95),
+      include_overhead_(false),
+      disable_receiver_padding_probing_(disable_receiver_padding_probing),
+      task_queue_pacer_(task_queue),
+      last_send_time_(webrtc::Timestamp::Millis(0)),
+      last_call_time_(webrtc::Timestamp::Millis(0)) {
+  for (auto& count : rtx_drop_reasons_)
+    count.store(0, std::memory_order_relaxed);
+  // Keep pending clusters dormant even if audio/RTX is queued before video.
+  pacing_controller_.SetProbingEnabled(!disable_receiver_padding_probing_);
+}
+
+PacedSender::~PacedSender() { Shutdown(); }
+
+void PacedSender::Shutdown() { is_shutdown_.store(true); }
+
+void PacedSender::SetFecBudgets(const std::map<uint32_t, int64_t>& rates,
+                               int64_t total_bps, uint64_t version) {
+  RunOrPost([this, rates, total_bps, version] {
+    if (version <= fec_budget_version_) return;
+    fec_budget_version_ = version;
+    fec_budget_managed_ = true;
+    const int64_t now_ms = clock_->CurrentTime().ms();
+    fec_budget_.SetRate(total_bps, now_ms);
+    for (auto it = fec_stream_budgets_.begin(); it != fec_stream_budgets_.end();) {
+      if (!rates.count(it->first)) it = fec_stream_budgets_.erase(it);
+      else ++it;
+    }
+    for (const auto& rate : rates)
+      fec_stream_budgets_[rate.first].SetRate(rate.second, now_ms);
+  });
+}
+
+void PacedSender::SetRtxBudget(int64_t bps, uint64_t version) {
+  RunOrPost([this, bps, version] {
+    if (version <= rtx_budget_version_) return;
+    rtx_budget_version_ = version;
+    rtx_budget_bps_ = bps;
+    const int64_t now_ms = clock_->CurrentTime().ms();
+    rtx_admission_budget_.SetRate(bps, now_ms);
+    rtx_send_budget_.SetRate(bps, now_ms);
+    // NACKs arrive in batches. Allow 100 ms of repairs (at least one datagram,
+    // at most 32 KiB) while the ordinary pacer still controls each send burst.
+    const size_t burst_bytes =
+        static_cast<size_t>(std::clamp<int64_t>(bps / 80, 1500, 32768));
+    rtx_admission_budget_.SetMaxBurstBytes(burst_bytes);
+    rtx_send_budget_.SetMaxBurstBytes(burst_bytes);
+    FlushDeferredRtx();
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::RunOrPost(AnyInvocable<void()> task) {
+  if (is_shutdown_.load()) {
+    return;
+  }
+  if (task_queue_pacer_->IsCurrent()) {
+    task();
+    return;
+  }
+  if (!task_queue_pacer_->PostTask(std::move(task))) {
+    LOG_WARN("PacedSender task rejected: pacer task queue is stopped");
+  }
+}
+
+void PacedSender::SetOnSentPacketFunc(
+    std::function<void(std::unique_ptr<webrtc::RtpPacketToSend>,
+                       const webrtc::PacedPacketInfo&)>
+        on_sent_packet_func) {
+  RunOrPost([this, on_sent_packet_func = std::move(on_sent_packet_func)]()
+                mutable {
+    on_sent_packet_func_ = std::move(on_sent_packet_func);
+  });
+}
+
+void PacedSender::SetGeneratePaddingFunc(
+    std::function<std::vector<std::unique_ptr<RtpPacket>>(uint32_t, int64_t)>
+        generat_padding_func) {
+  RunOrPost([this, generat_padding_func = std::move(generat_padding_func)]()
+                mutable {
+    generat_padding_func_ = std::move(generat_padding_func);
+  });
+}
+
+void PacedSender::SetOnRtpPacketDroppedFunc(
+    std::function<void(const webrtc::RtpPacketToSend&)> callback) {
+  RunOrPost([this, callback = std::move(callback)]() mutable {
+    on_rtp_packet_dropped_func_ = std::move(callback);
+  });
+}
+
+PacedSender::RtxDropStats PacedSender::GetRtxDropStats() const {
+  RtxDropStats result;
+  const auto count = [this](RtxDropReason reason) {
+    return rtx_drop_reasons_[static_cast<size_t>(reason)].load(
+        std::memory_order_relaxed);
+  };
+  result.superseded = count(RtxDropReason::kSuperseded);
+  result.paused = count(RtxDropReason::kPaused);
+  result.not_ready = count(RtxDropReason::kNotReady);
+  result.congested = count(RtxDropReason::kCongested);
+  result.expired = count(RtxDropReason::kExpired);
+  result.budget = count(RtxDropReason::kBudget);
+  result.deferred_overflow = count(RtxDropReason::kDeferredOverflow);
+  result.queue_discard = count(RtxDropReason::kQueueDiscard);
+  result.shutdown = count(RtxDropReason::kShutdown);
+  result.total = result.superseded + result.paused + result.not_ready +
+                 result.congested + result.expired + result.budget +
+                 result.deferred_overflow + result.queue_discard +
+                 result.shutdown;
+  return result;
+}
+
+PacedSender::RtxDropReason PacedSender::VideoRtxDropReason(
+    const webrtc::RtpPacketToSend& packet) const {
+  return video_send_paused_ ||
+                 (video_pause_time_.IsFinite() &&
+                  packet.capture_time() <= video_pause_time_)
+             ? RtxDropReason::kPaused
+             : RtxDropReason::kSuperseded;
+}
+
+void PacedSender::NotifyRtxDropped(const webrtc::RtpPacketToSend& packet,
+                                   RtxDropReason reason) {
+  if (packet.packet_type() != webrtc::RtpPacketMediaType::kRetransmission)
+    return;
+  ++rtx_dropped_;
+  rtx_drop_reasons_[static_cast<size_t>(reason)].fetch_add(
+      1, std::memory_order_relaxed);
+  // Release the history entry's pending flag so a later NACK can retry.
+  if (on_rtp_packet_dropped_func_) on_rtp_packet_dropped_func_(packet);
+}
+
+void PacedSender::OnPacketDiscarded(const webrtc::RtpPacketToSend& packet) {
+  // The controller callback does not carry a discard cause. It can include
+  // queue expiry, SSRC removal, pause, or a keyframe flush; keep it generic.
+  NotifyRtxDropped(packet, RtxDropReason::kQueueDiscard);
+  if (packet.packet_type() == webrtc::RtpPacketMediaType::kForwardErrorCorrection)
+    ++fec_dropped_;
+}
+
+void PacedSender::RegisterVideoSsrc(uint32_t media_ssrc, uint32_t rtx_ssrc,
+                                   std::function<void()> on_keyframe) {
+  RunOrPost([this, media_ssrc, rtx_ssrc, on_keyframe = std::move(on_keyframe)] {
+    video_streams_.insert_or_assign(
+        media_ssrc, VideoStream{rtx_ssrc, webrtc::Timestamp::MinusInfinity(),
+                               on_keyframe});
+  });
+}
+
+void PacedSender::UnregisterVideoSsrc(uint32_t media_ssrc) {
+  RunOrPost([this, media_ssrc] {
+    auto it = video_streams_.find(media_ssrc);
+    if (it == video_streams_.end()) return;
+    RemovePacketsForSsrcOnQueue(media_ssrc);
+    if (it->second.rtx_ssrc != media_ssrc)
+      RemovePacketsForSsrcOnQueue(it->second.rtx_ssrc);
+    video_streams_.erase(it);
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+std::optional<uint32_t> PacedSender::GetRtxSsrcForMedia(uint32_t ssrc) const {
+  const auto it = video_streams_.find(ssrc);
+  if (it == video_streams_.end() || !it->second.rtx_ssrc ||
+      it->second.rtx_ssrc == ssrc)
+    return std::nullopt;
+  return it->second.rtx_ssrc;
+}
+
+void PacedSender::OnKeyframeEnqueued(uint32_t ssrc,
+                                    webrtc::Timestamp capture_time) {
+  auto stream = video_streams_.find(ssrc);
+  if (stream == video_streams_.end()) return;
+  stream->second.keyframe_capture_time = capture_time;
+  for (auto it = deferred_rtx_.begin(); it != deferred_rtx_.end();) {
+    if (it->packet->original_ssrc().value_or(it->packet->Ssrc()) != ssrc) {
+      ++it;
+      continue;
+    }
+    deferred_rtx_bytes_ -= it->packet->size() + 64;
+    NotifyRtxDropped(*it->packet, RtxDropReason::kSuperseded);
+    it = deferred_rtx_.erase(it);
+  }
+  // FEC shares the RTX SSRC. Forget the old partial block so a delayed flush
+  // cannot recreate repairs for media superseded by this keyframe.
+  if (stream->second.on_keyframe) stream->second.on_keyframe();
+}
+
+void PacedSender::SetProbeAbortedCallback(
+    std::function<void(int, webrtc::Timestamp, const char*)> callback) {
+  RunOrPost([this, callback = std::move(callback)]() mutable {
+    probe_aborted_callback_ = std::move(callback);
+    pacing_controller_.SetProbeAbortedCallback(
+        [this](int id, const char* reason) { NotifyProbeAborted(id, reason); });
+  });
+}
+
+void PacedSender::SetVideoSendPausedCallback(
+    std::function<void(bool, webrtc::Timestamp)> callback) {
+  RunOrPost([this, callback = std::move(callback)]() mutable {
+    video_send_paused_callback_ = std::move(callback);
+  });
+}
+
+void PacedSender::SetProbeCompletedCallback(
+    std::function<void(int, int, webrtc::Timestamp)> callback) {
+  RunOrPost([this, callback = std::move(callback)]() mutable {
+    pacing_controller_.SetProbeCompletedCallback(std::move(callback));
+  });
+}
+
+void PacedSender::NotifyProbeAborted(int id, const char* reason) {
+  if (probe_aborted_callback_)
+    probe_aborted_callback_(id, clock_->CurrentTime(), reason);
+}
+
+bool PacedSender::RtxExpired(const webrtc::RtpPacketToSend& packet) const {
+  // Desktop frame recovery finishes well before one second. Do not let
+  // repeated NACKs extend an obsolete frame's lifetime indefinitely.
+  return packet.capture_time().IsFinite() &&
+         clock_->CurrentTime() - packet.capture_time() >=
+             webrtc::TimeDelta::Seconds(1);
+}
+
+void PacedSender::DeferRtx(std::unique_ptr<webrtc::RtpPacketToSend> packet) {
+  const size_t bytes = packet->size() + 64;
+  const size_t limit = static_cast<size_t>(
+      std::clamp<int64_t>(rtx_budget_bps_ / 40, 2400, 32768));
+  if (deferred_rtx_bytes_ + bytes > limit) {
+    NotifyRtxDropped(*packet, RtxDropReason::kDeferredOverflow);
+    return;
+  }
+  // Keep history pending while credit refills, so repeated NACKs cannot
+  // recreate and immediately discard the same packet on every feedback.
+  deferred_rtx_bytes_ += bytes;
+  ++rtx_deferred_;
+  auto position = deferred_rtx_.end();
+  if (packet->is_key_frame())
+    position = std::find_if(
+        deferred_rtx_.begin(), deferred_rtx_.end(),
+        [](const DeferredRtx& item) { return !item.packet->is_key_frame(); });
+  deferred_rtx_.insert(
+      position, {std::move(packet),
+                 clock_->CurrentTime() + webrtc::TimeDelta::Millis(200)});
+}
+
+void PacedSender::FlushDeferredRtx() {
+  const auto now = clock_->CurrentTime();
+  for (auto it = deferred_rtx_.begin(); it != deferred_rtx_.end();) {
+    const auto& packet = *it->packet;
+    const size_t bytes = packet.size() + 64;
+    std::optional<RtxDropReason> reason;
+    if (!transport_ready_) reason = RtxDropReason::kNotReady;
+    else if (rtx_congested_) reason = RtxDropReason::kCongested;
+    else if (rtx_budget_bps_ == 0) reason = RtxDropReason::kBudget;
+    else if (ShouldDropVideoPacket(packet)) reason = VideoRtxDropReason(packet);
+    else if (RtxExpired(packet) || now >= it->deadline)
+      reason = RtxDropReason::kExpired;
+    if (!reason && !rtx_admission_budget_.Consume(bytes, now.ms())) {
+      ++it;
+      continue;
+    }
+    auto ready = std::move(it->packet);
+    deferred_rtx_bytes_ -= bytes;
+    it = deferred_rtx_.erase(it);
+    if (reason)
+      NotifyRtxDropped(*ready, *reason);
+    else
+      EnqueueReadyPacket(std::move(ready));
+  }
+}
+
+std::vector<std::unique_ptr<webrtc::RtpPacketToSend>>
+PacedSender::GeneratePadding(webrtc::DataSize size) {
+  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> to_send_rtp_packets;
+  if (is_shutdown_.load() || video_send_paused_ ||
+      clock_->CurrentTime() < probe_pause_until_ ||
+      (disable_receiver_padding_probing_ && !has_local_video_)) {
+    return to_send_rtp_packets;
+  }
+  const webrtc::Timestamp padding_time = clock_->CurrentTime();
+  std::vector<std::unique_ptr<RtpPacket>> rtp_packets =
+      generat_padding_func_(size.bytes(), padding_time.us());
+  for (auto &packet : rtp_packets) {
+    std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet_to_send(
+        static_cast<webrtc::RtpPacketToSend *>(packet.release()));
+
+    rtp_packet_to_send->set_capture_time(padding_time);
+    rtp_packet_to_send->set_transport_sequence_number((transport_seq_)++);
+    rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kPadding);
+
+    to_send_rtp_packets.push_back(std::move(rtp_packet_to_send));
+  }
+
+  return to_send_rtp_packets;
+}
+
+void PacedSender::SetSendBurstInterval(webrtc::TimeDelta burst_interval) {
+  RunOrPost([this, burst_interval] {
+    pacing_controller_.SetSendBurstInterval(burst_interval);
+  });
+}
+
+void PacedSender::SetAllowProbeWithoutMediaPacket(bool allow) {
+  RunOrPost([this, allow] {
+    allow_probe_without_media_packet_ = allow;
+    pacing_controller_.SetAllowProbeWithoutMediaPacket(
+        allow && (!disable_receiver_padding_probing_ || has_local_video_));
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::SetTransportReady(bool ready) {
+  RunOrPost([this, ready] {
+    transport_ready_ = ready;
+    if (ready) {
+      pacing_controller_.Resume();
+      return;
+    }
+
+    pacing_controller_.AbortProbing("transport_not_ready");
+    pacing_controller_.Pause();
+    FlushDeferredRtx();
+    next_process_time_ = webrtc::Timestamp::MinusInfinity();
+  });
+}
+
+void PacedSender::EnsureStarted() {
+  RunOrPost([this] {
+    is_started_ = true;
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::CreateProbeClusters(
+    std::vector<webrtc::ProbeClusterConfig> probe_cluster_configs) {
+  RunOrPost([this, probe_cluster_configs = std::move(probe_cluster_configs)]()
+                mutable {
+    if (video_send_paused_ || clock_->CurrentTime() < probe_pause_until_) {
+      for (const auto& config : probe_cluster_configs)
+        NotifyProbeAborted(config.id, video_send_paused_ ? "video_paused"
+                                                        : "probe_hold");
+      return;
+    }
+    // A controller update queued before recovery must not become a fresh
+    // probe if the pacer only processes it after the hold has ended.
+    probe_cluster_configs.erase(
+        std::remove_if(probe_cluster_configs.begin(), probe_cluster_configs.end(),
+                       [this](const auto& config) {
+                         if (config.at_time >= probe_pause_until_) return false;
+                         NotifyProbeAborted(config.id, "stale_before_probe_hold");
+                         return true;
+                       }),
+        probe_cluster_configs.end());
+    if (probe_cluster_configs.empty()) return;
+    if (probe_bitrate_limit_bps_ > 0) {
+      const auto limit = webrtc::DataRate::BitsPerSec(probe_bitrate_limit_bps_);
+      for (auto& config : probe_cluster_configs)
+        config.target_data_rate = std::min(config.target_data_rate, limit);
+    }
+    if (!transport_ready_) {
+      for (const auto& config : probe_cluster_configs) {
+        LOG_WARN(
+            "Probe cluster discarded: id={} reason=transport_not_ready "
+            "target_bitrate_bps={} target_bytes={} target_packets={}",
+            config.id, config.target_data_rate.bps(),
+            (config.target_data_rate * config.target_duration).bytes(),
+            config.target_probe_count);
+        NotifyProbeAborted(config.id, "transport_not_ready");
+      }
+      return;
+    }
+    pacing_controller_.CreateProbeClusters(probe_cluster_configs);
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::SetProbeBitrateLimit(int max_bitrate_bps) {
+  RunOrPost([this, max_bitrate_bps] {
+    if (probe_bitrate_limit_bps_ == max_bitrate_bps) return;
+    if (max_bitrate_bps > 0 &&
+        (probe_bitrate_limit_bps_ == 0 ||
+         max_bitrate_bps < probe_bitrate_limit_bps_)) {
+      pacing_controller_.AbortProbing("video_budget_reduced");
+    }
+    probe_bitrate_limit_bps_ = max_bitrate_bps;
+  });
+}
+
+void PacedSender::PauseProbingUntil(webrtc::Timestamp until) {
+  RunOrPost([this, until] {
+    probe_pause_until_ = std::max(probe_pause_until_, until);
+    pacing_controller_.AbortProbing("probe_hold");
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::SetVideoSendPaused(bool paused,
+                                    const std::vector<uint32_t>& ssrcs,
+                                    webrtc::Timestamp pause_time) {
+  RunOrPost([this, paused, ssrcs, pause_time] {
+    if (video_send_paused_ == paused) return;
+    video_send_paused_ = paused;
+    if (video_send_paused_callback_)
+      video_send_paused_callback_(paused, pause_time);
+    if (paused) {
+      // Use the API request time: a busy pacer can process pause/resume after
+      // the encoder has already produced the first fresh recovery keyframe.
+      video_pause_time_ = pause_time;
+      pacing_controller_.AbortProbing("video_paused");
+      for (uint32_t ssrc : ssrcs)
+        pacing_controller_.RemovePacketsForSsrc(ssrc);
+      FlushDeferredRtx();
+      UpdateStats();
+    }
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::Pause() {
+  RunOrPost([this] { pacing_controller_.Pause(); });
+}
+
+void PacedSender::Resume() {
+  RunOrPost([this] {
+    pacing_controller_.Resume();
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::SetCongested(bool congested) {
+  RunOrPost([this, congested] {
+    rtx_congested_ = congested;
+    pacing_controller_.SetCongested(congested);
+    FlushDeferredRtx();
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::SetPacingRates(webrtc::DataRate pacing_rate,
+                                 webrtc::DataRate padding_rate) {
+  RunOrPost([this, pacing_rate, padding_rate] {
+    pacing_controller_.SetPacingRates(pacing_rate, padding_rate);
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::EnqueuePackets(
+    std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> packets) {
+  RunOrPost([this, packets = std::move(packets)]() mutable {
+    EnqueuePacketsOnQueue(std::move(packets));
+  });
+}
+
+void PacedSender::EnqueuePacket(
+    std::unique_ptr<webrtc::RtpPacketToSend> packet) {
+  RunOrPost([this, packet = std::move(packet)]() mutable {
+    EnqueuePacketOnQueue(std::move(packet));
+    MaybeScheduleProcessPackets();
+  });
+}
+
+void PacedSender::EnqueuePacketsOnQueue(
+    std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> packets) {
+  for (auto& packet : packets) {
+    EnqueuePacketOnQueue(std::move(packet));
+  }
+  MaybeScheduleProcessPackets();
+}
+
+void PacedSender::EnqueuePacketOnQueue(
+    std::unique_ptr<webrtc::RtpPacketToSend> packet) {
+  // Also discard retransmissions posted late by the history queue, including
+  // after a quick pause/resume. They still carry the old capture timestamp.
+  if (ShouldDropVideoPacket(*packet)) {
+    NotifyRtxDropped(*packet, VideoRtxDropReason(*packet));
+    return;
+  }
+  if (packet->packet_type() == webrtc::RtpPacketMediaType::kRetransmission) {
+    std::optional<RtxDropReason> reason;
+    if (!transport_ready_) reason = RtxDropReason::kNotReady;
+    else if (rtx_congested_) reason = RtxDropReason::kCongested;
+    else if (RtxExpired(*packet)) reason = RtxDropReason::kExpired;
+    else if (rtx_budget_bps_ == 0) reason = RtxDropReason::kBudget;
+    if (reason) {
+      NotifyRtxDropped(*packet, *reason);
+      return;
+    }
+  }
+  if (packet->packet_type() == webrtc::RtpPacketMediaType::kRetransmission &&
+      !rtx_admission_budget_.Consume(packet->size() + 64,
+                                     clock_->CurrentTime().ms())) {
+    DeferRtx(std::move(packet));
+    return;
+  }
+  EnqueueReadyPacket(std::move(packet));
+}
+
+void PacedSender::EnqueueReadyPacket(
+    std::unique_ptr<webrtc::RtpPacketToSend> packet) {
+  packet->set_transport_sequence_number(transport_seq_++);
+  size_t packet_size = packet->payload_size() + packet->padding_size();
+  if (include_overhead_) {
+    packet_size += packet->headers_size();
+  }
+  packet_size_.Apply(1, packet_size);
+  if (!has_local_video_ &&
+      packet->packet_type() == webrtc::RtpPacketMediaType::kVideo) {
+    has_local_video_ = true;
+    if (disable_receiver_padding_probing_) {
+      pacing_controller_.SetProbingEnabled(true);
+      pacing_controller_.SetAllowProbeWithoutMediaPacket(
+          allow_probe_without_media_packet_);
+    }
+  }
+  pacing_controller_.EnqueuePacket(std::move(packet));
+}
+
+void PacedSender::RemovePacketsForSsrc(uint32_t ssrc) {
+  RunOrPost([this, ssrc] {
+    RemovePacketsForSsrcOnQueue(ssrc);
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::RemovePacketsForSsrcOnQueue(uint32_t ssrc) {
+  for (auto it = deferred_rtx_.begin(); it != deferred_rtx_.end();) {
+    if (it->packet->Ssrc() != ssrc) {
+      ++it;
+      continue;
+    }
+    deferred_rtx_bytes_ -= it->packet->size() + 64;
+    NotifyRtxDropped(*it->packet, RtxDropReason::kQueueDiscard);
+    it = deferred_rtx_.erase(it);
+  }
+  pacing_controller_.RemovePacketsForSsrc(ssrc);
+}
+
+void PacedSender::SetAccountForAudioPackets(bool account_for_audio) {
+  RunOrPost([this, account_for_audio] {
+    pacing_controller_.SetAccountForAudioPackets(account_for_audio);
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::SetIncludeOverhead() {
+  RunOrPost([this] {
+    include_overhead_ = true;
+    pacing_controller_.SetIncludeOverhead();
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::SetTransportOverhead(
+    webrtc::DataSize overhead_per_packet) {
+  RunOrPost([this, overhead_per_packet] {
+    pacing_controller_.SetTransportOverhead(overhead_per_packet);
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+void PacedSender::SetQueueTimeLimit(webrtc::TimeDelta limit) {
+  RunOrPost([this, limit] {
+    pacing_controller_.SetQueueTimeLimit(limit);
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  });
+}
+
+webrtc::TimeDelta PacedSender::ExpectedQueueTime() const {
+  return GetStats().expected_queue_time;
+}
+
+webrtc::DataSize PacedSender::QueueSizeData() const {
+  return GetStats().queue_size;
+}
+
+std::optional<webrtc::Timestamp> PacedSender::FirstSentPacketTime() const {
+  return GetStats().first_sent_packet_time;
+}
+
+webrtc::TimeDelta PacedSender::OldestPacketWaitTime() const {
+  webrtc::Timestamp oldest_packet = GetStats().oldest_packet_enqueue_time;
+  if (oldest_packet.IsInfinite()) {
+    return webrtc::TimeDelta::Zero();
+  }
+
+  // (webrtc:9716): The clock is not always monotonic.
+  webrtc::Timestamp current = clock_->CurrentTime();
+  if (current < oldest_packet) {
+    return webrtc::TimeDelta::Zero();
+  }
+
+  return current - oldest_packet;
+}
+
+void PacedSender::OnStatsUpdated(const Stats& stats) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  current_stats_ = stats;
+}
+
+void PacedSender::MaybeScheduleProcessPackets() {
+  if (!processing_packets_) {
+    MaybeProcessPackets(webrtc::Timestamp::MinusInfinity());
+  }
+}
+
+void PacedSender::MaybeProcessPackets(
+    webrtc::Timestamp scheduled_process_time) {
+  if (is_shutdown_.load() || !is_started_ || !transport_ready_) {
+    return;
+  }
+
+  if (scheduled_process_time.IsFinite()) {
+    if (scheduled_process_time != next_process_time_) {
+      return;
+    }
+    next_process_time_ = webrtc::Timestamp::MinusInfinity();
+  }
+
+  // Protects against re-entry from transport feedback calling into the task
+  // queue pacer.
+  processing_packets_ = true;
+  auto cleanup = std::unique_ptr<PacedSender,
+                                 std::function<void(PacedSender*)>>(
+      this, [](PacedSender* sender) { sender->processing_packets_ = false; });
+
+  FlushDeferredRtx();
+  webrtc::Timestamp next_send_time = pacing_controller_.NextSendTime();
+  const webrtc::Timestamp now = clock_->CurrentTime();
+  webrtc::TimeDelta early_execute_margin =
+      pacing_controller_.IsProbing()
+          ? webrtc::PacingController::kMaxEarlyProbeProcessing
+          : webrtc::TimeDelta::Zero();
+
+  // Process packets and update stats.
+  while (!is_shutdown_.load() &&
+         next_send_time <= now + early_execute_margin) {
+    pacing_controller_.ProcessPackets();
+    next_send_time = pacing_controller_.NextSendTime();
+
+    // Probing state could change. Get margin after process packets.
+    early_execute_margin =
+        pacing_controller_.IsProbing()
+            ? webrtc::PacingController::kMaxEarlyProbeProcessing
+            : webrtc::TimeDelta::Zero();
+  }
+
+  if (is_shutdown_.load()) {
+    return;
+  }
+
+  UpdateStats();
+
+  if (!deferred_rtx_.empty())
+    next_send_time =
+        std::min(next_send_time, now + webrtc::TimeDelta::Millis(10));
+
+  // Do not hold back in probing.
+  webrtc::TimeDelta hold_back_window = webrtc::TimeDelta::Zero();
+  if (!pacing_controller_.IsProbing()) {
+    hold_back_window = max_hold_back_window_;
+    webrtc::DataRate pacing_rate = pacing_controller_.pacing_rate();
+    if (max_hold_back_window_in_packets_ != kNoPacketHoldback &&
+        !pacing_rate.IsZero() &&
+        packet_size_.filtered() != rtc::ExpFilter::kValueUndefined) {
+      webrtc::TimeDelta avg_packet_send_time =
+          webrtc::DataSize::Bytes(packet_size_.filtered()) / pacing_rate;
+      hold_back_window =
+          std::min(hold_back_window,
+                   avg_packet_send_time * max_hold_back_window_in_packets_);
+    }
+  }
+
+  // Calculate next process time.
+  webrtc::TimeDelta time_to_next_process =
+      std::max(hold_back_window, next_send_time - now - early_execute_margin);
+  next_send_time = now + time_to_next_process;
+
+  // If no in flight task or in flight task is later than `next_send_time`,
+  // schedule a new one. Previous in flight task will be retired.
+  if (next_process_time_.IsMinusInfinity() ||
+      next_process_time_ > next_send_time) {
+    if (task_queue_pacer_->PostDelayedHighPrecisionTask(
+            [this, next_send_time]() { MaybeProcessPackets(next_send_time); },
+            std::chrono::microseconds(time_to_next_process
+                                          .RoundUpTo(
+                                              webrtc::TimeDelta::Millis(1))
+                                          .us()))) {
+      next_process_time_ = next_send_time;
+    } else {
+      LOG_WARN("Pacer process task rejected: task queue is stopped");
+    }
+  }
+}
+
+void PacedSender::UpdateStats() {
+  Stats new_stats;
+  new_stats.expected_queue_time = pacing_controller_.ExpectedQueueTime();
+  new_stats.first_sent_packet_time = pacing_controller_.FirstSentPacketTime();
+  new_stats.oldest_packet_enqueue_time =
+      pacing_controller_.OldestPacketEnqueueTime();
+  new_stats.queue_size = pacing_controller_.QueueSizeData();
+  OnStatsUpdated(new_stats);
+}
+
+PacedSender::Stats PacedSender::GetStats() const {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  return current_stats_;
+}
+
+/*----------------------------------------------------------------------------*/
+
+int PacedSender::EnqueueRtpPackets(
+    std::vector<std::unique_ptr<RtpPacket>> &rtp_packets,
+    int64_t captured_timestamp_us, const std::string &stream_name) {
+  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> to_send_rtp_packets;
+  for (auto &rtp_packet : rtp_packets) {
+    std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet_to_send(
+        static_cast<webrtc::RtpPacketToSend *>(rtp_packet.release()));
+    rtp_packet_to_send->set_capture_time(
+        webrtc::Timestamp::Micros(captured_timestamp_us));
+    rtp_packet_to_send->set_stream_name(stream_name);
+
+    switch (rtp_packet_to_send->PayloadType()) {
+      case rtp::PAYLOAD_TYPE::H264:
+        rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kVideo);
+        break;
+      case rtp::PAYLOAD_TYPE::AV1:
+        rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kVideo);
+        break;
+      case rtp::PAYLOAD_TYPE::H264_FEC_SOURCE:
+        rtp_packet_to_send->set_packet_type(
+            webrtc::RtpPacketMediaType::kForwardErrorCorrection);
+        break;
+      case rtp::PAYLOAD_TYPE::H264_FEC_REPAIR:
+        rtp_packet_to_send->set_packet_type(
+            webrtc::RtpPacketMediaType::kForwardErrorCorrection);
+        break;
+      case rtp::PAYLOAD_TYPE::OPUS:
+        rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kAudio);
+        break;
+      default:
+        rtp_packet_to_send->set_packet_type(webrtc::RtpPacketMediaType::kVideo);
+        break;
+    }
+    // webrtc::PacedPacketInfo cluster_info;
+    // SendPacket(std::move(rtp_packet_to_send), cluster_info);
+
+    to_send_rtp_packets.push_back(std::move(rtp_packet_to_send));
+  }
+
+  EnqueuePackets(std::move(to_send_rtp_packets));
+  return 0;
+}
+
+int PacedSender::EnqueueRtpPackets(
+    std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> &rtp_packets) {
+  EnqueuePackets(std::move(rtp_packets));
+  return 0;
+}
+
+int PacedSender::EnqueueRtpPacket(
+    std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet) {
+  if (is_shutdown_.load()) {
+    return -1;
+  }
+  EnqueuePacket(std::move(rtp_packet));
+  return 0;
+}
+}  // namespace minirtc

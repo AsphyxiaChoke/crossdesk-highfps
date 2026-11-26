@@ -1,0 +1,151 @@
+name: Build Windows High-FPS HD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  XMAKE_MIN_VERSION: "3.1.1"
+  XMAKE_GLOBALDIR: D:\xmake_global
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 (Installer + Portable)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve desktop version
+        id: version
+        shell: bash
+        run: |
+          python3 scripts/version.py check client
+          BASE_VER="$(python3 scripts/version.py show desktop --field version)"
+          BUILD_DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          VERSION_NUM="v${BASE_VER}-${BUILD_DATE}"
+          echo "VERSION_NUM=${VERSION_NUM}" >> "$GITHUB_ENV"
+          echo "Resolved VERSION_NUM=${VERSION_NUM}"
+
+      - name: Cache xmake dependencies
+        uses: actions/cache@v4
+        with:
+          path: D:\xmake_global\.xmake\packages
+          key: windows-xmake-deps-cuda-${{ hashFiles('xmake.lua', 'apps/desktop/xmake/**/*.lua', 'deps/submodules/minirtc/xmake.lua') }}
+          restore-keys: |
+            windows-xmake-deps-cuda-
+
+      - name: Ensure minimum Xmake version
+        uses: ./.github/actions/ensure-xmake
+        with:
+          minimum-version: ${{ env.XMAKE_MIN_VERSION }}
+
+      - name: Prepare CUDA dependencies
+        working-directory: ${{ runner.temp }}
+        shell: pwsh
+        run: |
+          xmake repo -u
+          xmake create cuda
+          Push-Location cuda
+          xmake g --theme=plain
+          $cudaPath = ""
+          $packagesPath = "D:\xmake_global\.xmake\packages"
+          if (Test-Path $packagesPath) {
+            try {
+              $info = xmake require --info "cuda 12.6.3" 2>$null
+              if ($null -ne $info -and $info -ne "") {
+                $cudaPath = (($info | Select-String installdir).ToString() -replace '.*installdir:\s*','').Trim()
+              }
+            } catch {}
+          }
+          if (-not $cudaPath -or -not (Test-Path $cudaPath)) {
+            Write-Host "Installing CUDA 12.6.3 package via xmake..."
+            xmake require -vy "cuda 12.6.3"
+            $info = xmake require --info "cuda 12.6.3"
+            $cudaPath = (($info | Select-String installdir).ToString() -replace '.*installdir:\s*','').Trim()
+          }
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Resolved CUDA_PATH = $cudaPath"
+          Pop-Location
+
+      - name: Setup NSIS plugins
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $url = "https://github.com/DigitalMediaServer/NSIS-INetC-plugin/releases/download/v1.0.5.7/InetC.zip"
+          $out = "$env:RUNNER_TEMP\InetC.zip"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Expand-Archive $out -DestinationPath "$env:RUNNER_TEMP\InetC" -Force
+          $nsisPluginDir = "C:\Program Files (x86)\NSIS\Plugins\x86-unicode"
+          Copy-Item "$env:RUNNER_TEMP\InetC\x86-unicode\INetC.dll" "$nsisPluginDir\INetC.dll" -Force
+          Copy-Item "${{ github.workspace }}\apps\desktop\scripts\windows\nsProcess.dll" $nsisPluginDir -Force
+
+      - name: Build CrossDesk & Run Wire Unit Tests
+        shell: pwsh
+        run: |
+          xmake f --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true -y
+          xmake b -vy wire_test keyboard_state_wire_test crossdesk
+          xmake r wire_test
+          xmake r keyboard_state_wire_test
+
+      - name: Package Windows Installer
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\apps\desktop\scripts\windows\pkg_x64.ps1" $env:VERSION_NUM
+
+      - name: Build & Package Portable CrossDesk
+        shell: pwsh
+        run: |
+          xmake f --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=true --CROSSDESK_PORTABLE=true -y
+          xmake b -vy crossdesk
+
+          $buildDir = "${{ github.workspace }}\build\windows\x64\release"
+          $portableDir = "${{ github.workspace }}\portable"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+
+          $portableFiles = @(
+            @("crossdesk.exe", "CrossDesk.exe"),
+            @("crossdesk_service.exe", "crossdesk_service.exe"),
+            @("crossdesk_session_helper.exe", "crossdesk_session_helper.exe"),
+            @("crossdesk_privacy_cursor_helper.exe", "crossdesk_privacy_cursor_helper.exe"),
+            @("crossdesk_privacy_window.dll", "crossdesk_privacy_window.dll"),
+            @("slint_cpp.dll", "slint_cpp.dll")
+          )
+          foreach ($file in $portableFiles) {
+            $source = Join-Path $buildDir $file[0]
+            $destination = Join-Path $portableDir $file[1]
+            if (!(Test-Path $source)) {
+              throw "Missing portable package file: $source"
+            }
+            Copy-Item $source $destination -Force
+          }
+          Copy-Item (Join-Path $buildDir "*.dll") $portableDir -Force
+
+          $driverDir = Join-Path $buildDir "usbmmidd_v2"
+          if (!(Test-Path (Join-Path $driverDir "deviceinstaller64.exe"))) {
+            throw "Missing bundled usbmmidd_v2 driver package: $driverDir"
+          }
+          Copy-Item $driverDir (Join-Path $portableDir "usbmmidd_v2") -Recurse -Force
+
+          Compress-Archive -Path "$portableDir\*" -DestinationPath "${{ github.workspace }}\crossdesk-win-x64-portable-${{ env.VERSION_NUM }}.zip" -Force
+
+      - name: Upload Windows Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossdesk-win-x64-installer
+          path: ${{ github.workspace }}/apps/desktop/scripts/windows/crossdesk-win-x64-${{ env.VERSION_NUM }}.exe
+          if-no-files-found: error
+
+      - name: Upload Windows Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossdesk-win-x64-portable
+          path: ${{ github.workspace }}/crossdesk-win-x64-portable-${{ env.VERSION_NUM }}.zip
+          if-no-files-found: error

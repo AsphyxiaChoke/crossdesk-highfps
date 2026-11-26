@@ -1,0 +1,95 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2023-11-03
+ * Copyright (c) 2023 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _OPENH264_ENCODER_H_
+#define _OPENH264_ENCODER_H_
+
+#include <wels/codec_api.h>
+#include <wels/codec_app_def.h>
+#include <wels/codec_def.h>
+#include <wels/codec_ver.h>
+
+#include <functional>
+#include <vector>
+
+#include "media_codec.h"
+
+namespace minirtc {
+
+class OpenH264Encoder : public MediaCodec {
+ public:
+  OpenH264Encoder(std::shared_ptr<SystemClock> clock);
+  virtual ~OpenH264Encoder();
+
+  int Init(const MediaCodecConfig& config) override;
+
+  int Encode(const RawFrame& raw_frame,
+             std::function<int(const EncodedFrame& encoded_frame)>
+                 on_encoded_image) override;
+
+  int ForceIdr() override;
+
+  int SetTargetBitrate(int bitrate) override;
+
+  int SetTargetFrameRate(int frame_rate) override;
+
+  int GetResolution(int* width, int* height) const override {
+    if (seq_ == 0) {
+      return -1;
+    }
+
+    *width = frame_width_;
+    *height = frame_height_;
+    return 0;
+  }
+
+  std::string GetEncoderName() const override { return "OpenH264 (H.264)"; }
+
+ private:
+  int InitEncoderParams(int width, int height);
+  int ResetEncodeResolution(unsigned int width, unsigned int height);
+
+  int Release();
+
+ private:
+  std::shared_ptr<SystemClock> clock_ = nullptr;
+  uint32_t frame_width_ = 3840;
+  uint32_t frame_height_ = 2160;
+  int key_frame_interval_ = 3000;
+  int target_bitrate_ = MINIRTC_INIT_BITRATE;
+  int max_bitrate_ = kDefaultMaxEncoderBitrateBps;
+  int max_payload_size_ = 1150;
+  int max_fps_ = 30;
+  bool desktop_realtime_rate_control_ = false;
+  MiniRtcVideoContentType video_content_type_ = MiniRtcVideoContentType::ScreenContent;
+  MiniRtcVideoDegradationPreference video_degradation_preference_ =
+      MiniRtcVideoDegradationPreference::MaintainFrameRate;
+  std::vector<std::vector<uint8_t>> encoded_packets_;
+  unsigned char* encoded_image_ = nullptr;
+  FILE* file_h264_ = nullptr;
+  FILE* file_nv12_ = nullptr;
+  std::string h264_file_name_;
+  std::string nv12_file_name_;
+  unsigned char* nv12_data_ = nullptr;
+  unsigned int seq_ = 0;
+
+  // openh264
+  ISVCEncoder* openh264_encoder_ = nullptr;
+  SEncParamExt encoder_params_;
+  int video_format_;
+  SSourcePicture raw_frame_;
+  unsigned char* yuv420p_frame_ = nullptr;
+  size_t yuv420p_frame_capacity_ = 0;
+  bool got_output = false;
+  bool is_keyframe = false;
+  int temporal_ = 1;
+  uint8_t* encoded_frame_ = nullptr;
+  size_t encoded_frame_capacity_ = 0;
+  size_t encoded_frame_size_ = 0;
+};
+}  // namespace minirtc
+
+#endif

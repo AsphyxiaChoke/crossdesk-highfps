@@ -1,0 +1,23 @@
+package("aom")
+
+    set_homepage("https://aomedia.googlesource.com/aom/")
+    set_description("AV1 Codec Library")
+    set_license("BSD-2-Clause")
+    set_urls("https://github.com/kunkundi/aom.git")
+    add_versions("v3.9.0", "6cab58c3925e0f4138e15a4ed510161ea83b6db1")
+
+    add_deps("cmake~host", "nasm~host", {host = true})
+
+    if is_os("windows") then
+        add_defines("_CRT_SECURE_NO_WARNINGS")
+    end
+
+    on_install("windows", "linux", "macosx", "iphoneos", function (package)
+        local configs = {"-DENABLE_EXAMPLES=OFF", "-DENABLE_TESTS=OFF", "-DENABLE_TOOLS=OFF", "-DENABLE_DOCS=OFF", "-DBUILD_SHARED_LIBS=OFF"}
+        table.insert(configs, "-DCMAKE_BUILD_TYPE=" .. (package:debug() and "Debug" or "Release"))
+        import("package.tools.cmake").install(package, configs)
+    end)
+
+    on_test(function (package)
+        assert(package:has_cfuncs("aom_codec_version", {includes = "aom/aom_codec.h"}))
+    end)

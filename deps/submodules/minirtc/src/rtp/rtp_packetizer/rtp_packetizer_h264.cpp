@@ -1,0 +1,289 @@
+#include "rtp_packetizer_h264.h"
+
+namespace minirtc {
+
+RtpPacketizerH264::RtpPacketizerH264(uint32_t ssrc)
+    : version_(kRtpVersion),
+      has_padding_(false),
+      has_extension_(false),
+      csrc_count_(0),
+      marker_(false),
+      payload_type_(rtp::PAYLOAD_TYPE::H264),
+      sequence_number_(0),
+      timestamp_(0),
+      ssrc_(ssrc),
+      profile_(0),
+      extension_profile_(0),
+      extension_len_(0),
+      extension_data_(nullptr) {}
+
+RtpPacketizerH264::~RtpPacketizerH264() {}
+
+//  0                   1                   2                   3
+//  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |  ID   |  L=2  |              Absolute Send Time               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// ID (4 bits): the identifier negotiated for Absolute Send Time.
+std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerH264::Build(
+    uint8_t* payload, uint32_t payload_size, uint32_t rtp_timestamp,
+    bool use_rtp_packet_to_send) {
+  if (payload_size <= max_payload_size_) {
+    return BuildNalu(payload, payload_size, rtp_timestamp,
+                     use_rtp_packet_to_send);
+  } else {
+    return BuildFua(payload, payload_size, rtp_timestamp,
+                    use_rtp_packet_to_send);
+  }
+}
+
+std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerH264::BuildNalu(
+    uint8_t* payload, uint32_t payload_size, uint32_t rtp_timestamp,
+    bool use_rtp_packet_to_send) {
+  std::lock_guard<std::mutex> lock(packetizer_mutex_);
+  std::vector<std::unique_ptr<RtpPacket>> rtp_packets;
+
+  version_ = kRtpVersion;
+  has_padding_ = false;
+  has_extension_ = HasAbsoluteSendTimeExtension();
+  csrc_count_ = 0;
+  marker_ = 1;
+  payload_type_ = rtp::PAYLOAD_TYPE(payload_type_);
+  sequence_number_++;
+
+  timestamp_ = rtp_timestamp;
+
+  if (!csrc_count_) {
+  }
+
+  rtp::FU_INDICATOR fu_indicator;
+  fu_indicator.forbidden_bit = 0;
+  fu_indicator.nal_reference_idc = 1;
+  fu_indicator.nal_unit_type = rtp::NAL_UNIT_TYPE::NALU;
+
+  rtp_packet_frame_.clear();
+  rtp_packet_frame_.push_back((version_ << 6) | (has_padding_ << 5) |
+                              (has_extension_ << 4) | csrc_count_);
+  rtp_packet_frame_.push_back((marker_ << 7) | payload_type_);
+  rtp_packet_frame_.push_back((sequence_number_ >> 8) & 0xFF);
+  rtp_packet_frame_.push_back(sequence_number_ & 0xFF);
+  rtp_packet_frame_.push_back((timestamp_ >> 24) & 0xFF);
+  rtp_packet_frame_.push_back((timestamp_ >> 16) & 0xFF);
+  rtp_packet_frame_.push_back((timestamp_ >> 8) & 0xFF);
+  rtp_packet_frame_.push_back(timestamp_ & 0xFF);
+  rtp_packet_frame_.push_back((ssrc_ >> 24) & 0xFF);
+  rtp_packet_frame_.push_back((ssrc_ >> 16) & 0xFF);
+  rtp_packet_frame_.push_back((ssrc_ >> 8) & 0xFF);
+  rtp_packet_frame_.push_back(ssrc_ & 0xFF);
+
+  for (uint32_t index = 0; index < csrc_count_ && !csrcs_.empty(); index++) {
+    rtp_packet_frame_.push_back((csrcs_[index] >> 24) & 0xFF);
+    rtp_packet_frame_.push_back((csrcs_[index] >> 16) & 0xFF);
+    rtp_packet_frame_.push_back((csrcs_[index] >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(csrcs_[index] & 0xFF);
+  }
+
+  if (has_extension_) {
+    AppendAbsoluteSendTimeExtension(rtp_packet_frame_);
+  }
+
+  rtp_packet_frame_.push_back((fu_indicator.forbidden_bit << 7) |
+                              (fu_indicator.nal_reference_idc << 5) |
+                              fu_indicator.nal_unit_type);
+
+  rtp_packet_frame_.insert(rtp_packet_frame_.end(), payload,
+                           payload + payload_size);
+
+  if (use_rtp_packet_to_send) {
+    std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet =
+        std::make_unique<webrtc::RtpPacketToSend>();
+    if (rtp_packet->Build(rtp_packet_frame_.data(),
+                          rtp_packet_frame_.size())) {
+      rtp_packets.emplace_back(std::move(rtp_packet));
+    }
+  } else {
+    std::unique_ptr<RtpPacket> rtp_packet = std::make_unique<RtpPacket>();
+    if (rtp_packet->Build(rtp_packet_frame_.data(),
+                          rtp_packet_frame_.size())) {
+      rtp_packets.emplace_back(std::move(rtp_packet));
+    }
+  }
+
+  return rtp_packets;
+}
+
+std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerH264::BuildFua(
+    uint8_t* payload, uint32_t payload_size, uint32_t rtp_timestamp,
+    bool use_rtp_packet_to_send) {
+  std::lock_guard<std::mutex> lock(packetizer_mutex_);
+  std::vector<std::unique_ptr<RtpPacket>> rtp_packets;
+
+  uint32_t last_packet_size = payload_size % max_payload_size_;
+  uint32_t packet_num =
+      payload_size / max_payload_size_ + (last_packet_size ? 1 : 0);
+
+  for (uint32_t index = 0; index < packet_num; index++) {
+    version_ = kRtpVersion;
+    has_padding_ = false;
+    has_extension_ = HasAbsoluteSendTimeExtension();
+    csrc_count_ = 0;
+    marker_ = (index == (packet_num - 1)) ? 1 : 0;
+    payload_type_ = rtp::PAYLOAD_TYPE(payload_type_);
+    sequence_number_++;
+    timestamp_ = rtp_timestamp;
+    // ssrc_ = ssrc_;
+
+    if (!csrc_count_) {
+      // csrcs_ = csrcs_;
+    }
+
+    rtp::FU_INDICATOR fu_indicator;
+    fu_indicator.forbidden_bit = 0;
+    fu_indicator.nal_reference_idc = 0;
+    fu_indicator.nal_unit_type = rtp::NAL_UNIT_TYPE::FU_A;
+
+    rtp::FU_HEADER fu_header;
+    fu_header.start = index == 0 ? 1 : 0;
+    fu_header.end = index == packet_num - 1 ? 1 : 0;
+    fu_header.remain_bit = 0;
+    fu_header.nal_unit_type = rtp::NAL_UNIT_TYPE::FU_A;
+
+    rtp_packet_frame_.clear();
+    rtp_packet_frame_.push_back((version_ << 6) | (has_padding_ << 5) |
+                                (has_extension_ << 4) | csrc_count_);
+    rtp_packet_frame_.push_back((marker_ << 7) | payload_type_);
+    rtp_packet_frame_.push_back((sequence_number_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(sequence_number_ & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 24) & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 16) & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(timestamp_ & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 24) & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 16) & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(ssrc_ & 0xFF);
+
+    for (uint32_t csrc_index = 0; csrc_index < csrc_count_ && !csrcs_.empty();
+         csrc_index++) {
+      rtp_packet_frame_.push_back((csrcs_[csrc_index] >> 24) & 0xFF);
+      rtp_packet_frame_.push_back((csrcs_[csrc_index] >> 16) & 0xFF);
+      rtp_packet_frame_.push_back((csrcs_[csrc_index] >> 8) & 0xFF);
+      rtp_packet_frame_.push_back(csrcs_[csrc_index] & 0xFF);
+    }
+
+    if (has_extension_) {
+      AppendAbsoluteSendTimeExtension(rtp_packet_frame_);
+    }
+
+    rtp_packet_frame_.push_back(fu_indicator.forbidden_bit << 7 |
+                                fu_indicator.nal_reference_idc << 5 |
+                                fu_indicator.nal_unit_type);
+
+    rtp_packet_frame_.push_back(fu_header.start << 7 | fu_header.end << 6 |
+                                fu_header.remain_bit << 5 |
+                                fu_header.nal_unit_type);
+
+    if (index == packet_num - 1 && last_packet_size > 0) {
+      rtp_packet_frame_.insert(
+          rtp_packet_frame_.end(), payload + index * max_payload_size_,
+          payload + index * max_payload_size_ + last_packet_size);
+    } else {
+      rtp_packet_frame_.insert(
+          rtp_packet_frame_.end(), payload + index * max_payload_size_,
+          payload + index * max_payload_size_ + max_payload_size_);
+    }
+
+    if (use_rtp_packet_to_send) {
+      std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet =
+          std::make_unique<webrtc::RtpPacketToSend>();
+      if (rtp_packet->Build(rtp_packet_frame_.data(),
+                            rtp_packet_frame_.size())) {
+        rtp_packets.emplace_back(std::move(rtp_packet));
+      }
+    } else {
+      std::unique_ptr<RtpPacket> rtp_packet = std::make_unique<RtpPacket>();
+      if (rtp_packet->Build(rtp_packet_frame_.data(),
+                            rtp_packet_frame_.size())) {
+        rtp_packets.emplace_back(std::move(rtp_packet));
+      }
+    }
+  }
+
+  return rtp_packets;
+}
+
+std::vector<std::unique_ptr<RtpPacket>> RtpPacketizerH264::BuildPadding(
+    uint32_t payload_size, uint32_t rtp_timestamp,
+    bool use_rtp_packet_to_send) {
+  std::lock_guard<std::mutex> lock(packetizer_mutex_);
+  std::vector<std::unique_ptr<RtpPacket>> rtp_packets;
+
+  // The RTP padding count is an 8-bit field. Keep one standards-compliant
+  // padding byte at the end and carry the rest as probe payload under the
+  // dedicated padding payload type, so large probes do not explode into
+  // hundreds of tiny packets.
+  constexpr uint8_t kRtpPaddingSize = 1;
+  uint32_t remaining_size = payload_size;
+  while (remaining_size > 0) {
+    uint32_t packet_data_size =
+        std::min<uint32_t>(remaining_size, max_payload_size_);
+
+    version_ = kRtpVersion;
+    has_padding_ = true;
+    has_extension_ = HasAbsoluteSendTimeExtension();
+    csrc_count_ = 0;
+    marker_ = 0;
+    uint8_t payload_type = rtp::PAYLOAD_TYPE(payload_type_ - 1);
+    sequence_number_++;
+    timestamp_ = rtp_timestamp;
+
+    rtp_packet_frame_.clear();
+    rtp_packet_frame_.push_back((version_ << 6) | (has_padding_ << 5) |
+                                (has_extension_ << 4) | csrc_count_);
+    rtp_packet_frame_.push_back((marker_ << 7) | payload_type);
+    rtp_packet_frame_.push_back((sequence_number_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(sequence_number_ & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 24) & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 16) & 0xFF);
+    rtp_packet_frame_.push_back((timestamp_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(timestamp_ & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 24) & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 16) & 0xFF);
+    rtp_packet_frame_.push_back((ssrc_ >> 8) & 0xFF);
+    rtp_packet_frame_.push_back(ssrc_ & 0xFF);
+
+    for (uint32_t index = 0; index < csrc_count_ && !csrcs_.empty(); index++) {
+      rtp_packet_frame_.push_back((csrcs_[index] >> 24) & 0xFF);
+      rtp_packet_frame_.push_back((csrcs_[index] >> 16) & 0xFF);
+      rtp_packet_frame_.push_back((csrcs_[index] >> 8) & 0xFF);
+      rtp_packet_frame_.push_back(csrcs_[index] & 0xFF);
+    }
+
+    if (has_extension_) {
+      AppendAbsoluteSendTimeExtension(rtp_packet_frame_);
+    }
+
+    rtp_packet_frame_.insert(rtp_packet_frame_.end(), packet_data_size, 0);
+    rtp_packet_frame_.back() = kRtpPaddingSize;
+
+    if (use_rtp_packet_to_send) {
+      std::unique_ptr<webrtc::RtpPacketToSend> rtp_packet =
+          std::make_unique<webrtc::RtpPacketToSend>();
+      if (rtp_packet->Build(rtp_packet_frame_.data(),
+                            rtp_packet_frame_.size())) {
+        rtp_packets.emplace_back(std::move(rtp_packet));
+      }
+    } else {
+      std::unique_ptr<RtpPacket> rtp_packet = std::make_unique<RtpPacket>();
+      if (rtp_packet->Build(rtp_packet_frame_.data(),
+                            rtp_packet_frame_.size())) {
+        rtp_packets.emplace_back(std::move(rtp_packet));
+      }
+    }
+
+    remaining_size -= packet_data_size;
+  }
+
+  return rtp_packets;
+}
+}  // namespace minirtc

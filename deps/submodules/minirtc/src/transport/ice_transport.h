@@ -1,0 +1,325 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-01-03
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _ICE_TRANSPORT_H_
+#define _ICE_TRANSPORT_H_
+
+#include <atomic>
+#include <iostream>
+#include <optional>
+#include <unordered_set>
+
+#include "clock/system_clock.h"
+#include "ice_agent.h"
+#include "ice_component_state.h"
+#include "ice_transport_controller.h"
+#include "ice_utils.h"
+#include "io_statistics.h"
+#include "receiver_rtt.h"
+#include "ringbuffer.h"
+#include "rtcp_packet_info.h"
+#include "rtp_packet.h"
+#include "signal_sender.h"
+
+namespace minirtc {
+class IceTransport {
+ public:
+  typedef enum { MiniRtcDataTypeVideo = 96, MiniRtcDataTypeAudio = 97, MiniRtcDataTypeData = 120 } MiniRtcDataType;
+  typedef enum { H264 = 96, AV1 = 99 } VIDEO_TYPE;
+  enum VideoFrameType {
+    kEmptyFrame = 0,
+    kVideoFrameKey = 3,
+    kVideoFrameDelta = 4,
+  };
+
+  enum TraversalType { TP2P = 0, TRelay = 1, TUnknown = 2 };
+
+ public:
+  IceTransport(
+      std::shared_ptr<SystemClock> clock, bool offer_peer,
+      std::string& transmission_id, std::string& user_id,
+      std::string& remote_user_id,
+      std::shared_ptr<SignalSender> ice_ws_transmission,
+      std::function<void(std::string, const std::string&)> on_ice_status_change,
+      void* user_data);
+  ~IceTransport();
+
+ public:
+  int SetLocalCapabilities(bool hardware_acceleration,
+                           bool native_video_output,
+                           bool use_trickle_ice, bool use_reliable_ice,
+                           MiniRtcTurnMode turn_mode, bool enable_srtp,
+                           MiniRtcVideoContentType video_content_type,
+                           MiniRtcVideoQuality video_quality, int video_frame_rate,
+                           MiniRtcVideoDegradationPreference
+                               video_degradation_preference,
+                           rtp::PAYLOAD_TYPE prefered_video_payload_type,
+                           std::vector<int>& video_payload_types,
+                           std::vector<int>& audio_payload_types,
+                           StartingBitrates starting_bitrates = {},
+                           bool disable_receiver_padding_probing = false,
+                           bool desktop_realtime_rate_control = true);
+
+  void SetDirectPolicy(const DirectIcePolicy& policy,
+                       std::function<void(MiniRtcDirectError)> error) {
+    direct_policy_ = policy;
+    direct_error_ = std::move(error);
+  }
+  int InitIceTransmission(const IceServerConfiguration& ice_config);
+
+  int DestroyIceTransmission();
+
+  void SetOnReceiveFunc(OnReceiveVideo on_receive_video,
+                        OnReceiveAudio on_receive_audio,
+                        OnReceiveData on_receive_data,
+                        MiniRtcOnReceiveEncodedVideo encoded = nullptr) {
+    on_receive_video_ = on_receive_video;
+    on_receive_encoded_video_ = encoded;
+    on_receive_audio_ = on_receive_audio;
+    on_receive_data_ = on_receive_data;
+  }
+
+  void SetOnReceiveNetStatusReportFunc(
+      std::function<void(const char*, const size_t, MiniRtcTraversalMode,
+                         const MiniRtcNetTrafficStats*, const char*, const size_t,
+                         void*)>
+          on_receive_net_status_report) {
+    on_receive_net_status_report_ = on_receive_net_status_report;
+  }
+
+  void SetOnSelectedRoute(std::function<void(bool)> callback) {
+    on_selected_route_ = std::move(callback);
+  }
+
+  int JoinTransmission();
+
+  int SetTransmissionId(const std::string& transmission_id);
+
+  int SendVideoFrame(const MiniRtcVideoFrame* video_frame,
+                     const std::string& stream_name);
+
+  int RequestVideoKeyFrame(const std::string& stream_name);
+
+  int RequestAllVideoKeyFrames();
+  int UpdateVideoBitrateLimit(int max_bitrate_bps);
+  int SetVideoSendPaused(bool paused);
+  int SetAudioSendPaused(bool paused);
+  int UpdateVideoResolution(int width, int height);
+  int UpdateVideoSettings(MiniRtcVideoQuality quality, int frame_rate,
+                          MiniRtcVideoDegradationPreference preference);
+
+  int SendAudioFrame(const MiniRtcAudioFrame* audio_frame,
+                     const std::string& stream_name);
+
+  int SendDataFrame(const char* data, size_t size,
+                    const std::string& stream_name);
+
+  int SendReliableDataFrame(const char* data, size_t size,
+                            const std::string& stream_name);
+
+ public:
+  int GatherCandidates();
+
+  int SendLocalStreamSdp();
+
+  int SetRemoteSdp(const std::string& remote_sdp);
+
+  int AddRemoteCandidate(const std::string& candidate_sdp,
+                         const std::string& candidate_ufrag = "");
+
+  int SetRemoteCandidateGatheringDone(
+      const std::string& candidate_ufrag = "");
+
+  int SendOffer();
+
+  int SendAnswer();
+
+  int AddVideoStream(const std::string& stream_id);
+  int AddAudioStream(const std::string& stream_id);
+  int AddDataStream(const std::string& stream_id, bool reliable);
+
+  std::vector<rtp::PAYLOAD_TYPE> GetNegotiatedCapabilities();
+
+ private:
+  int AppendLocalCapabilitiesToOffer();
+  int AppendLocalCapabilitiesToAnswer();
+  void AppendLocalSenderSsrcAttributes(bool include_video_rtx,
+                                       std::string& video_attributes,
+                                       std::string& audio_attributes,
+                                       std::string& data_attributes);
+  void ParseSsrcFromSdpAndRemove(std::string& sdp_block,
+                                 std::map<std::string, uint32_t>& ssrc_map,
+                                 const std::string& media_type,
+                                 std::map<std::string, uint32_t>* rtx_ssrc_map =
+                                     nullptr);
+  std::string GetRemoteCapabilities(const std::string& remote_sdp);
+
+  bool NegotiateVideoPayloadType(const std::string& remote_sdp);
+  bool NegotiateAudioPayloadType(const std::string& remote_sdp);
+  bool NegotiateDataPayloadType(const std::string& remote_sdp);
+
+ private:
+  void AppendAudioDataSrtpCapability();
+  bool NegotiateSrtp(const std::string& remote_sdp, bool remote_has_fingerprint);
+
+  uint8_t CheckIsRtpPacket(const char* buffer, size_t size);
+  uint8_t CheckIsRtcpPacket(const char* buffer, size_t size);
+  uint8_t CheckIsVideoPacket(const char* buffer, size_t size);
+  uint8_t CheckIsAudioPacket(const char* buffer, size_t size);
+  uint8_t CheckIsDataPacket(const char* buffer, size_t size);
+
+ private:
+  void OnIceStateChange(NiceAgent* agent, guint stream_id, guint component_id,
+                        NiceComponentState state, gpointer user_ptr);
+
+  void OnNewLocalCandidate(NiceAgent* agent, NiceCandidate* candidate);
+
+  void OnGatheringDone(NiceAgent* agent, guint stream_id, gpointer user_ptr);
+
+  void OnNewSelectedPair(NiceAgent* agent, guint stream_id, guint component_id,
+                         const char* lfoundation, const char* rfoundation,
+                         gpointer user_ptr);
+
+  void ReportNetworkStats(MiniRtcNetTrafficStats& stats);
+
+  void OnReceiveBuffer(NiceAgent* agent, guint stream_id, guint component_id,
+                       guint size, gchar* buffer, gpointer user_ptr);
+
+  void OnDtlsHandshakeDone(gpointer user_ptr);
+
+  bool ParseRtcpPacket(const uint8_t* buffer, size_t size,
+                       RtcpPacketInfo* rtcp_packet_info);
+  bool HandleExtendedReport(const RtcpCommonHeader& block);
+  ReceiverRtt receiver_rtt_;
+  uint32_t receiver_rtt_ssrc_ = 0;
+
+  void HandleReportBlock(const RtcpReportBlock& rtcp_report_block,
+                         RtcpPacketInfo* packet_information,
+                         uint32_t remote_ssrc);
+
+  bool HandleSenderReport(const RtcpCommonHeader& rtcp_block,
+                          RtcpPacketInfo* rtcp_packet_info);
+
+  bool HandleReceiverReport(const RtcpCommonHeader& rtcp_block,
+                            RtcpPacketInfo* rtcp_packet_info);
+
+  bool HandleCongestionControlFeedback(const RtcpCommonHeader& rtcp_block,
+                                       RtcpPacketInfo* rtcp_packet_info);
+
+  bool HandleNack(const RtcpCommonHeader& rtcp_block,
+                  RtcpPacketInfo* rtcp_packet_info);
+
+  bool HandleFir(const RtcpCommonHeader& rtcp_block,
+                 RtcpPacketInfo* rtcp_packet_info);
+
+ private:
+  bool hardware_acceleration_ = false;
+  StartingBitrates starting_bitrates_;
+  bool disable_receiver_padding_probing_ = false;
+  bool desktop_realtime_rate_control_ = true;
+  bool native_video_output_ = false;
+  bool use_trickle_ice_ = true;
+  bool use_reliable_ice_ = false;
+  MiniRtcTurnMode turn_mode_ = MiniRtcTurnMode::MiniRtcTurnDisabled;
+  bool enable_srtp_ = true;
+  bool audio_data_srtp_enabled_ = false;
+  MiniRtcVideoContentType video_content_type_ = MiniRtcVideoContentType::ScreenContent;
+  MiniRtcVideoQuality video_quality_ = MiniRtcVideoQualityHigh;
+  int video_frame_rate_ = 60;
+  MiniRtcVideoDegradationPreference video_degradation_preference_ =
+      MiniRtcVideoDegradationPreference::MaintainResolution;
+
+  std::vector<std::string> video_stream_ids_;
+  std::vector<std::string> audio_stream_ids_;
+  std::map<std::string, bool> data_stream_ids_;
+
+  std::vector<std::string> remote_video_stream_ids_;
+  std::vector<std::string> remote_audio_stream_ids_;
+  std::vector<std::string> remote_data_stream_ids_;
+
+  std::map<std::string, uint32_t> video_senders_ssrc_;
+  std::map<std::string, uint32_t> audio_senders_ssrc_;
+  std::map<std::string, uint32_t> data_senders_ssrc_;
+
+  std::map<std::string, uint32_t> video_receivers_ssrc_;
+  std::map<std::string, uint32_t> video_receivers_rtx_ssrc_;
+  std::map<std::string, uint32_t> audio_receivers_ssrc_;
+  std::map<std::string, uint32_t> data_receivers_ssrc_;
+  std::map<std::string, bool> remote_data_stream_reliable_;
+
+  std::vector<int> support_video_payload_types_;
+  std::vector<int> support_audio_payload_types_;
+  std::vector<int> support_data_payload_types_;
+
+  std::string local_sdp_;
+  std::string remote_sdp_;
+  std::string local_candidates_;
+  std::string remote_candidates_;
+  unsigned int connection_id_ = 0;
+  bool offer_peer_;
+  std::string transmission_id_;
+  std::string user_id_;
+  std::string remote_user_id_;
+  std::string remote_ice_username_ = "";
+  std::string local_ice_username_ = "";
+  std::unordered_set<std::string> seen_local_candidate_sdps_;
+  std::mutex local_candidate_mutex_;
+  std::unordered_set<std::string> remote_candidate_keys_;
+  std::vector<IceCandidateSignal> pending_remote_candidates_;
+  bool local_gathering_done_sent_ = false;
+  bool remote_gathering_done_ = false;
+  std::atomic<NiceComponentState> state_{NICE_COMPONENT_STATE_DISCONNECTED};
+  IceComponentStateTracker component_state_tracker_;
+  std::function<void(bool)> on_selected_route_;
+  std::mutex selected_pair_mutex_;
+  TraversalType traversal_type_ = TraversalType::TUnknown;
+  std::string local_endpoint_;
+  std::string remote_endpoint_;
+  void* user_data_ = nullptr;
+
+ private:
+  std::shared_ptr<SystemClock> clock_;
+  std::shared_ptr<IceAgent> ice_agent_ = nullptr;
+  std::atomic<bool> is_closed_{false};
+  std::shared_ptr<SignalSender> ice_ws_transport_ = nullptr;
+  DirectIcePolicy direct_policy_;
+  std::function<void(MiniRtcDirectError)> direct_error_;
+  std::atomic<bool> secure_ready_reported_{false};
+
+  OnReceiveVideo on_receive_video_ = nullptr;
+  MiniRtcOnReceiveEncodedVideo on_receive_encoded_video_ = nullptr;
+  OnReceiveAudio on_receive_audio_ = nullptr;
+  OnReceiveData on_receive_data_ = nullptr;
+
+  std::function<void(std::string, const std::string&)> on_ice_status_change_ =
+      nullptr;
+
+  std::function<void(const char*, const size_t, MiniRtcTraversalMode,
+                     const MiniRtcNetTrafficStats*, const char*, const size_t, void*)>
+      on_receive_net_status_report_ = nullptr;
+
+ private:
+  std::shared_ptr<IceTransportController> ice_transport_controller_ = nullptr;
+
+ private:
+  std::shared_ptr<IOStatistics> ice_io_statistics_ = nullptr;
+
+ private:
+  rtp::PAYLOAD_TYPE prefered_video_payload_type_;
+  bool remote_capabilities_got_ = false;
+  rtp::PAYLOAD_TYPE remote_prefered_audio_pt_ = rtp::PAYLOAD_TYPE::UNDEFINED;
+  rtp::PAYLOAD_TYPE remote_prefered_data_pt_ = rtp::PAYLOAD_TYPE::UNDEFINED;
+  rtp::PAYLOAD_TYPE negotiated_video_pt_ = rtp::PAYLOAD_TYPE::UNDEFINED;
+  rtp::PAYLOAD_TYPE negotiated_audio_pt_ = rtp::PAYLOAD_TYPE::UNDEFINED;
+  rtp::PAYLOAD_TYPE negotiated_data_pt_ = rtp::PAYLOAD_TYPE::UNDEFINED;
+  std::optional<uint8_t> video_abs_send_time_ext_id_;
+  std::optional<uint8_t> video_abs_recv_time_ext_id_;
+  std::optional<uint8_t> audio_abs_send_time_ext_id_;
+  std::optional<uint8_t> audio_abs_recv_time_ext_id_;
+};
+}  // namespace minirtc
+
+#endif

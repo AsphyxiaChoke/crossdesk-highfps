@@ -1,0 +1,288 @@
+#include "dav1d_av1_decoder.h"
+
+#include <utility>
+
+#include "log.h"
+
+// #define SAVE_DECODED_NV12_STREAM
+// #define SAVE_RECEIVED_AV1_STREAM
+
+#include "libyuv.h"
+#include "native_video_frame.h"
+#include "sdr_color.h"
+#if defined(_WIN32) || defined(__linux__)
+#include "native_nv12_frame.h"
+#endif
+
+namespace minirtc {
+
+class ScopedDav1dPicture {
+ public:
+  ~ScopedDav1dPicture() { dav1d_picture_unref(&picture_); }
+
+  Dav1dPicture &Picture() { return picture_; }
+
+ private:
+  Dav1dPicture picture_ = {};
+};
+
+class ScopedDav1dData {
+ public:
+  ~ScopedDav1dData() { dav1d_data_unref(&data_); }
+
+  Dav1dData &Data() { return data_; }
+
+ private:
+  Dav1dData data_ = {};
+};
+
+// Calling `dav1d_data_wrap` requires a `free_callback` to be registered.
+void NullFreeCallback([[maybe_unused]] const uint8_t *buffer,
+                      [[maybe_unused]] void *opaque) {}
+
+Dav1dAv1Decoder::Dav1dAv1Decoder(std::shared_ptr<SystemClock> clock,
+                                 bool native_video_output)
+    : clock_(std::move(clock)),
+      native_video_output_(native_video_output) {
+#if !defined(_WIN32) && !defined(__linux__)
+  native_video_output_ = false;
+#endif
+}
+
+Dav1dAv1Decoder::~Dav1dAv1Decoder() {
+  if (context_) {
+    dav1d_close(&context_);
+  }
+
+  if (decoded_frame_) {
+    delete decoded_frame_;
+  }
+
+#ifdef SAVE_DECODED_NV12_STREAM
+  if (file_nv12_) {
+    fflush(file_nv12_);
+    fclose(file_nv12_);
+    file_nv12_ = nullptr;
+  }
+#endif
+
+#ifdef SAVE_RECEIVED_AV1_STREAM
+  if (file_av1_) {
+    fflush(file_av1_);
+    fclose(file_av1_);
+    file_av1_ = nullptr;
+  }
+#endif
+
+  if (nv12_frame_) {
+    delete[] nv12_frame_;
+    nv12_frame_ = nullptr;
+  }
+}
+
+int Dav1dAv1Decoder::Init() {
+  Dav1dSettings s;
+  dav1d_default_settings(&s);
+
+  s.n_threads = std::max(2, 8);
+  s.max_frame_delay = 1;  // For low latency decoding.
+  s.all_layers = 0;       // Don't output a frame for every spatial layer.
+  // Limit max frame size to avoid OOM'ing fuzzers. crbug.com/325284120.
+  s.frame_size_limit = 16384 * 16384;
+  s.operating_point = 31;  // Decode all operating points.
+
+  int ret = dav1d_open(&context_, &s);
+  if (ret) {
+    LOG_ERROR("Dav1d AV1 decoder open failed, error={}", ret);
+    return -1;
+  }
+
+#if defined(_WIN32) || defined(__linux__)
+  if (native_video_output_) {
+    native_frame_pool_ = NativeNv12FramePool::Create();
+    LOG_INFO("dav1d pooled native NV12 output enabled");
+  }
+#endif
+
+#ifdef SAVE_DECODED_NV12_STREAM
+  nv12_file_name_ = "decoded_nv12_stream_" +
+                    std::to_string(reinterpret_cast<uintptr_t>(this)) + ".yuv";
+  file_nv12_ = fopen(nv12_file_name_.c_str(), "w+b");
+  if (!file_nv12_) {
+    LOG_WARN("Fail to open {}", nv12_file_name_.c_str());
+  }
+#endif
+
+#ifdef SAVE_RECEIVED_AV1_STREAM
+  av1_file_name_ = "recived_h264_stream_" +
+                   std::to_string(reinterpret_cast<uintptr_t>(this)) + ".ivf";
+  file_av1_ = fopen(av1_file_name_.c_str(), "w+b");
+  if (!file_av1_) {
+    LOG_WARN("Fail to open {}", av1_file_name_.c_str());
+  }
+#endif
+
+  return 0;
+}
+
+int Dav1dAv1Decoder::Decode(
+    std::unique_ptr<ReceivedFrame> received_frame,
+    std::function<void(const DecodedFrame *)> on_receive_decoded_frame) {
+  if (!received_frame || !context_) {
+    return -1;
+  }
+  const uint8_t *data = received_frame->Buffer();
+  size_t size = received_frame->Size();
+
+#ifdef SAVE_RECEIVED_AV1_STREAM
+  fwrite((unsigned char *)data, 1, size, file_av1_);
+#endif
+
+  ScopedDav1dData scoped_dav1d_data;
+  Dav1dData &dav1d_data = scoped_dav1d_data.Data();
+  const int wrap_result = dav1d_data_wrap(
+      &dav1d_data, data, size,
+      /*free_callback=*/&NullFreeCallback,
+      /*user_data=*/nullptr);
+  if (wrap_result != 0) {
+    LOG_ERROR("Dav1d AV1 input wrap failed, error={}", wrap_result);
+    return -1;
+  }
+
+  if (int decode_res = dav1d_send_data(context_, &dav1d_data)) {
+    // On EAGAIN, dav1d can not consume more data and
+    // dav1d_get_picture needs to be called first, which
+    // will happen below, so just keep going in that case
+    // and do not error out.
+    if (decode_res != DAV1D_ERR(EAGAIN)) {
+      LOG_ERROR("Dav1dAv1Decoder::Decode decoding failed with error code {}",
+                decode_res);
+      return -1;
+    }
+  }
+
+  ScopedDav1dPicture scoped_dav1d_picture;
+  Dav1dPicture &dav1d_picture = scoped_dav1d_picture.Picture();
+  if (int get_picture_res = dav1d_get_picture(context_, &dav1d_picture)) {
+    // On EAGAIN, it means dav1d has not enough data to decode
+    // therefore this is not a decoding error but just means
+    // we need to feed it more data, which happens in the next
+    // run of the decoder loop.
+    if (get_picture_res == DAV1D_ERR(EAGAIN)) {
+      return -2;
+    } else {
+      return -1;
+    }
+  }
+
+  const auto& format = dav1d_picture.p;
+  if (format.bpc != 8 || format.layout != DAV1D_PIXEL_LAYOUT_I420 ||
+      format.w <= 0 || format.h <= 0 ||
+      !GetNv12FrameSize(format.w, format.h, &nv12_frame_size_)) {
+    LOG_ERROR("Unsupported dav1d output: {}x{}, layout={}, bit depth={}",
+              format.w, format.h, static_cast<int>(format.layout), format.bpc);
+    return -1;
+  }
+  const auto* sequence = dav1d_picture.seq_hdr;
+  const SdrColor color{sequence && sequence->color_range,
+                       sequence && sequence->mtrx == DAV1D_MC_BT709};
+  frame_width_ = format.w;
+  frame_height_ = format.h;
+
+#if defined(_WIN32) || defined(__linux__)
+  if (native_video_output_) {
+    auto* native_frame = native_frame_pool_
+                             ? native_frame_pool_->Acquire(frame_width_,
+                                                           frame_height_)
+                             : nullptr;
+    if (!native_frame) {
+      LOG_ERROR("Failed to acquire pooled dav1d NV12 frame");
+      return -1;
+    }
+    const int conversion_result = libyuv::I420ToNV12(
+        static_cast<const uint8_t*>(dav1d_picture.data[0]),
+        static_cast<int>(dav1d_picture.stride[0]),
+        static_cast<const uint8_t*>(dav1d_picture.data[1]),
+        static_cast<int>(dav1d_picture.stride[1]),
+        static_cast<const uint8_t*>(dav1d_picture.data[2]),
+        static_cast<int>(dav1d_picture.stride[1]), native_frame->YPlane(),
+        frame_width_, native_frame->UvPlane(), frame_width_, frame_width_,
+        frame_height_);
+    if (conversion_result != 0) {
+      native_frame->Release();
+      LOG_ERROR("dav1d I420 to pooled NV12 conversion failed, ret {}",
+                conversion_result);
+      return -1;
+    }
+
+    color.Normalize(native_frame->YPlane(), frame_width_, frame_height_);
+    DecodedFrame native_decoded_frame;
+    native_decoded_frame.SetSize(native_frame->Size());
+    native_decoded_frame.SetWidth(received_frame->Width());
+    native_decoded_frame.SetHeight(received_frame->Height());
+    native_decoded_frame.SetDecodedWidth(frame_width_);
+    native_decoded_frame.SetDecodedHeight(frame_height_);
+    native_decoded_frame.SetReceivedTimestamp(
+        received_frame->ReceivedTimestamp());
+    native_decoded_frame.SetCapturedTimestamp(
+        received_frame->CapturedTimestamp());
+    native_decoded_frame.SetDecodedTimestamp(clock_->CurrentTime());
+    native_decoded_frame.SetNativeFrame(native_frame->Descriptor());
+#ifdef SAVE_DECODED_NV12_STREAM
+    if (file_nv12_) {
+      fwrite(native_frame->Data(), 1, native_frame->Size(), file_nv12_);
+    }
+#endif
+    on_receive_decoded_frame(&native_decoded_frame);
+    native_frame->Release();
+    return 0;
+  }
+#endif
+
+  if (!nv12_frame_) {
+    nv12_frame_capacity_ = nv12_frame_size_;
+    nv12_frame_ = new unsigned char[nv12_frame_capacity_];
+  }
+
+  if (nv12_frame_capacity_ < nv12_frame_size_) {
+    nv12_frame_capacity_ = nv12_frame_size_;
+    delete[] nv12_frame_;
+    nv12_frame_ = new unsigned char[nv12_frame_capacity_];
+  }
+
+  const int conversion_result = libyuv::I420ToNV12(
+      (const uint8_t *)dav1d_picture.data[0], (int)dav1d_picture.stride[0],
+      (const uint8_t *)dav1d_picture.data[1], (int)dav1d_picture.stride[1],
+      (const uint8_t *)dav1d_picture.data[2], (int)dav1d_picture.stride[1],
+      nv12_frame_, frame_width_, nv12_frame_ + frame_width_ * frame_height_,
+      frame_width_, frame_width_, frame_height_);
+  if (conversion_result != 0) {
+    LOG_ERROR("dav1d I420 to NV12 conversion failed, ret {}", conversion_result);
+    return -1;
+  }
+
+  if (!decoded_frame_) {
+    decoded_frame_ = new DecodedFrame(nv12_frame_size_,
+                                      frame_width_, frame_height_);
+  }
+
+  // A smaller frame may reuse a larger allocation after a resolution change.
+  // Publish only the decoded pixels, never the allocation's stale tail.
+  color.Normalize(nv12_frame_, frame_width_, frame_height_);
+  decoded_frame_->UpdateBuffer(nv12_frame_, nv12_frame_size_);
+  decoded_frame_->SetWidth(frame_width_);
+  decoded_frame_->SetHeight(frame_height_);
+  decoded_frame_->SetDecodedWidth(frame_width_);
+  decoded_frame_->SetDecodedHeight(frame_height_);
+  decoded_frame_->SetReceivedTimestamp(received_frame->ReceivedTimestamp());
+  decoded_frame_->SetCapturedTimestamp(received_frame->CapturedTimestamp());
+  decoded_frame_->SetDecodedTimestamp(clock_->CurrentTime());
+#ifdef SAVE_DECODED_NV12_STREAM
+  fwrite((unsigned char *)decoded_frame_->Buffer(), 1, decoded_frame_->Size(),
+         file_nv12_);
+#endif
+  on_receive_decoded_frame(decoded_frame_);
+
+  return 0;
+}
+}  // namespace minirtc
