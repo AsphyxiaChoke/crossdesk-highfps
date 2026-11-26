@@ -136,11 +136,11 @@ class ConfigCenter {
   LANGUAGE language_ = LANGUAGE::SYSTEM;
   CONNECTION_MODE connection_mode_ = CONNECTION_MODE::DEVICE_ID;
   bool enable_ip_direct_ = true;
-  std::atomic<bool> desktop_realtime_rate_control_{false};
-  VIDEO_ENCODE_FORMAT video_encode_format_ = VIDEO_ENCODE_FORMAT::H264;
+  std::atomic<bool> desktop_realtime_rate_control_{true};
+  VIDEO_ENCODE_FORMAT video_encode_format_ = VIDEO_ENCODE_FORMAT::H265;
   TURN_MODE turn_mode_ = TURN_MODE::AUTO_UDP_TCP;
-  static constexpr int kDefaultDirectStartBitrateBps = 25'000'000;
-  static constexpr int kDefaultRelayStartBitrateBps = 4'000'000;
+  static constexpr int kDefaultDirectStartBitrateBps = 8'000'000;
+  static constexpr int kDefaultRelayStartBitrateBps = 3'500'000;
   int direct_start_bitrate_bps_ = kDefaultDirectStartBitrateBps;
   int relay_start_bitrate_bps_ = kDefaultRelayStartBitrateBps;
   static constexpr bool kDefaultDisableReceiverPaddingProbing = false;

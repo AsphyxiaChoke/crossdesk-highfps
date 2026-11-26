@@ -129,14 +129,15 @@ int ConfigCenter::Load() {
   persist_config_migration |= ini_->Delete(section_, "screen_capture_method");
 
   desktop_realtime_rate_control_.store(ini_->GetBoolValue(
-      section_, "desktop_realtime_rate_control", ini_->GetBoolValue(section_, "nvenc_single_pass", false)));
+      section_, "desktop_realtime_rate_control", ini_->GetBoolValue(section_, "nvenc_single_pass", true)));
   if (ini_->Delete(section_, "nvenc_single_pass")) {
     ini_->SetBoolValue(section_, "desktop_realtime_rate_control", desktop_realtime_rate_control_.load());
     persist_config_migration = true;
   }
-  const long codec = ini_->GetLongValue(section_, "video_encode_format", 0);
+  const long codec = ini_->GetLongValue(
+      section_, "video_encode_format", static_cast<long>(VIDEO_ENCODE_FORMAT::H265));
   video_encode_format_ = codec >= 0 && codec <= static_cast<long>(VIDEO_ENCODE_FORMAT::H265)
-      ? static_cast<VIDEO_ENCODE_FORMAT>(codec) : VIDEO_ENCODE_FORMAT::H264;
+      ? static_cast<VIDEO_ENCODE_FORMAT>(codec) : VIDEO_ENCODE_FORMAT::H265;
 
   const char* turn_mode_value = ini_->GetValue(section_, "turn_mode", nullptr);
   if (turn_mode_value != nullptr && strlen(turn_mode_value) > 0) {
@@ -179,9 +180,26 @@ int ConfigCenter::Load() {
     }
     disable_receiver_padding_probing_ = false;
     ini_->SetBoolValue(section_, "disable_receiver_padding_probing", false);
-    desktop_realtime_rate_control_.store(false);
-    ini_->SetBoolValue(section_, "desktop_realtime_rate_control", false);
+    desktop_realtime_rate_control_.store(true);
+    ini_->SetBoolValue(section_, "desktop_realtime_rate_control", true);
     ini_->SetBoolValue(section_, "hd_bitrate_migrated_v1", true);
+    persist_config_migration = true;
+  }
+  if (!ini_->GetBoolValue(section_, "h265_default_migrated_v1", false)) {
+    video_encode_format_ = VIDEO_ENCODE_FORMAT::H265;
+    ini_->SetLongValue(section_, "video_encode_format",
+                       static_cast<long>(video_encode_format_));
+    if (direct_start_bitrate_bps_ == 2'500'000 ||
+        direct_start_bitrate_bps_ == 25'000'000) {
+      direct_start_bitrate_bps_ = kDefaultDirectStartBitrateBps;
+    }
+    if (relay_start_bitrate_bps_ == 1'500'000 ||
+        relay_start_bitrate_bps_ == 4'000'000) {
+      relay_start_bitrate_bps_ = kDefaultRelayStartBitrateBps;
+    }
+    desktop_realtime_rate_control_.store(true);
+    ini_->SetBoolValue(section_, "desktop_realtime_rate_control", true);
+    ini_->SetBoolValue(section_, "h265_default_migrated_v1", true);
     persist_config_migration = true;
   }
   if (!ini_->GetValue(section_, "disable_receiver_padding_probing", nullptr)) {
@@ -341,6 +359,7 @@ int ConfigCenter::Save() {
   ini_->SetBoolValue(section_, "disable_receiver_padding_probing",
                     disable_receiver_padding_probing_);
   ini_->SetBoolValue(section_, "hd_bitrate_migrated_v1", true);
+  ini_->SetBoolValue(section_, "h265_default_migrated_v1", true);
   ini_->SetBoolValue(section_, "enable_turn",
                     turn_mode_ != TURN_MODE::DISABLED);
   ini_->SetBoolValue(section_, "enable_srtp", true);

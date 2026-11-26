@@ -13,8 +13,8 @@ inline constexpr int kDefaultMaxEncoderBitrateBps = 80'000'000;
 inline constexpr int kMaxEncoderOvershootPercent = 50;
 
 struct StartingBitrates {
-  int direct_bps = 25'000'000;
-  int relay_bps = 4'000'000;
+  int direct_bps = 8'000'000;
+  int relay_bps = 3'500'000;
 
   static bool IsValid(int bps) {
     return bps >= 300'000 && bps <= kDefaultMaxNetworkBitrateBps;
