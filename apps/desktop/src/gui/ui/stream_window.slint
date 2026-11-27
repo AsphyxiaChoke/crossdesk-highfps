@@ -319,7 +319,7 @@ component UuSegmentRow inherits UuSettingRow {
                 overflow: elide;
             }
             option-touch := TouchArea {
-                mouse-cursor: root.enabled ? pointer : default;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
                 clicked => { if root.enabled { root.choose(index); } }
                 scroll-event(event) => { accept }
             }
@@ -409,7 +409,7 @@ component UuActionTile inherits Rectangle {
     }
 
     tile-touch := TouchArea {
-        mouse-cursor: root.interactive ? pointer : default;
+        mouse-cursor: root.interactive ? MouseCursor.pointer : MouseCursor.default;
         scroll-event(event) => { accept }
         // Keep disabled tiles hit-testable so clicks inside the panel never leak to peer.
         clicked => { if root.interactive { root.clicked(); } }
@@ -1287,7 +1287,7 @@ export component StreamWindow inherits Window {
                 }
 
                 pill-touch := TouchArea {
-                    mouse-cursor: root.control-hand-cursor-supported ? pointer : default;
+                    mouse-cursor: root.control-hand-cursor-supported ? MouseCursor.pointer : MouseCursor.default;
                     scroll-event(event) => { accept }
                     pointer-event(event) => {
                         let gx = control.x + self.mouse-x;
@@ -1307,7 +1307,7 @@ export component StreamWindow inherits Window {
                 height: parent.height;
                 z: 9;
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     pointer-event(event) => {
                         if event.kind == PointerEventKind.up { root.close-control-menus(); }
                     }
@@ -1325,7 +1325,7 @@ export component StreamWindow inherits Window {
                 z: 11;
 
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     scroll-event(event) => { accept }
                 }
 
@@ -1429,7 +1429,7 @@ export component StreamWindow inherits Window {
                                         overflow: elide;
                                     }
                                     disp-touch := TouchArea {
-                                        mouse-cursor: pointer;
+                                        mouse-cursor: MouseCursor.pointer;
                                         scroll-event(event) => { accept }
                                         clicked => {
                                             root.selected-display = index;
@@ -1484,7 +1484,7 @@ export component StreamWindow inherits Window {
                                 }
                                 res-btn-touch := TouchArea {
                                     enabled: root.remote-resolution-enabled;
-                                    mouse-cursor: root.remote-resolution-enabled ? pointer : default;
+                                    mouse-cursor: root.remote-resolution-enabled ? MouseCursor.pointer : MouseCursor.default;
                                     scroll-event(event) => { accept }
                                     clicked => { root.resolution-list-open = !root.resolution-list-open; }
                                 }
@@ -1534,7 +1534,7 @@ export component StreamWindow inherits Window {
                                             vertical-alignment: center;
                                         }
                                         res-opt-touch := TouchArea {
-                                            mouse-cursor: pointer;
+                                            mouse-cursor: MouseCursor.pointer;
                                             scroll-event(event) => { accept }
                                             clicked => {
                                                 root.resolution-selection = index;
@@ -1723,7 +1723,7 @@ export component StreamWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 min-touch := TouchArea {
-                                    mouse-cursor: pointer;
+                                    mouse-cursor: MouseCursor.pointer;
                                     scroll-event(event) => { accept }
                                     clicked => { root.close-control-menus(); root.minimize-stream-window(); }
                                 }
@@ -1744,7 +1744,7 @@ export component StreamWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 disc-touch := TouchArea {
-                                    mouse-cursor: pointer;
+                                    mouse-cursor: MouseCursor.pointer;
                                     scroll-event(event) => { accept }
                                     clicked => { root.disconnect-confirm-open = true; }
                                 }
@@ -1777,7 +1777,7 @@ export component StreamWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 cancel-disc-touch := TouchArea {
-                                    mouse-cursor: pointer;
+                                    mouse-cursor: MouseCursor.pointer;
                                     scroll-event(event) => { accept }
                                     clicked => { root.disconnect-confirm-open = false; }
                                 }
@@ -1798,7 +1798,7 @@ export component StreamWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 confirm-disc-touch := TouchArea {
-                                    mouse-cursor: pointer;
+                                    mouse-cursor: MouseCursor.pointer;
                                     scroll-event(event) => { accept }
                                     clicked => {
                                         root.close-control-menus();
@@ -1821,7 +1821,7 @@ export component StreamWindow inherits Window {
                 clip: true;
 
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     scroll-event(event) => { accept }
                 }
 
@@ -2125,7 +2125,7 @@ export component StreamWindow inherits Window {
                             }
                             mode-hover := TouchArea {
                                 enabled: index == 4 && root.stats-local-endpoint != "" && root.stats-remote-endpoint != "";
-                                mouse-cursor: default;
+                                mouse-cursor: MouseCursor.default;
                             }
                             if index == 5 && root.stats-encryption-enabled: Text {
                                 x: parent.width - parent.badge-padding - 10px;
@@ -2183,7 +2183,7 @@ export component StreamWindow inherits Window {
                 background: #0c162c52;
                 z: 13;
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     scroll-event(event) => { accept }
                 }
             }
@@ -2251,7 +2251,7 @@ export component StreamWindow inherits Window {
                 border-radius: UiRadius.surface;
                 z: 14;
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     scroll-event(event) => { accept }
                 }
                 remote-update-title := Text {
@@ -2296,7 +2296,7 @@ export component StreamWindow inherits Window {
                 border-radius: UiRadius.surface;
                 z: 7;
                 TouchArea {
-                    mouse-cursor: default;
+                    mouse-cursor: MouseCursor.default;
                     scroll-event(event) => { accept }
                 }
                 Text {
