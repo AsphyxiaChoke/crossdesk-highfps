@@ -77,38 +77,52 @@ int main() {
   };
   settle();
   const float top = stream->get_video_area_top();
-  // The initial control is only the logo. Wait for the toolbar reveal before
-  // clicking network status, just as a user does in a new session.
-  const slint::LogicalPosition logo({19, top + 19});
-  stream->window().dispatch_pointer_move_event(logo);
-  stream->window().dispatch_pointer_press_event(logo, slint::PointerEventButton::Left);
-  stream->window().dispatch_pointer_release_event(logo, slint::PointerEventButton::Left);
-  settle(20);
+  const auto is_dark_surface = [](slint::Rgb8Pixel p) {
+    return p.r >= 12 && p.r <= 80 && p.g >= 14 && p.g <= 90 && p.b >= 20 && p.b <= 110;
+  };
+  const auto click_pill = [&] {
+    const slint::LogicalPosition pill({
+        stream->get_control_pill_x() + stream->get_control_pill_width() / 2,
+        top + stream->get_control_pill_y() + stream->get_control_pill_height() / 2});
+    stream->window().dispatch_pointer_move_event(pill);
+    stream->window().dispatch_pointer_press_event(pill, slint::PointerEventButton::Left);
+    stream->window().dispatch_pointer_release_event(pill, slint::PointerEventButton::Left);
+    settle();
+  };
+  // The initial control is only the UU floating capsule. Expand the Control Center first.
+  click_pill();
   for (bool dock_right : {false, true}) {
     if (dock_right) {
-      stream->invoke_begin_control_drag(5, 20);
-      stream->invoke_move_control_drag(1275, 20);
+      stream->invoke_begin_control_drag(64, 25);
+      stream->invoke_move_control_drag(1220, 25);
       stream->invoke_end_control_drag();
       settle();
+      click_pill();
     }
-    // With privacy visible and no Windows shortcuts, the toolbar is 344 px.
-    // Its logo moves to the trailing edge when docked on the right.
-    const int control_x = dock_right ? int(stream->get_video_area_width()) - 344 : 0;
-    const slint::LogicalPosition button({float(control_x + (dock_right ? 214 : 250)), top + 19});
+    const int panel_x = int(stream->get_control_panel_x());
+    const int panel_y = int(stream->get_control_panel_y_pos());
+    if (!is_dark_surface(adapter.pixels[(int(top) + panel_y + 30) * 1280 + panel_x + 4])) {
+      std::cerr << "UU Control Center panel did not render dark surface; dock_right=" << dock_right << '\n';
+      return 1;
+    }
+    const slint::LogicalPosition button(
+        {float(panel_x + 308), top + stream->get_quick_grid_y() + 81});
     stream->window().dispatch_pointer_move_event(button);
-    settle(35); // Include the tooltip that appears before the click.
+    settle();
     for (bool expanded : {true, false, true, false}) {
       stream->window().dispatch_pointer_press_event(button, slint::PointerEventButton::Left);
       stream->window().dispatch_pointer_release_event(button, slint::PointerEventButton::Left);
-      settle(); // No pointer movement: animation must finish on its own.
+      settle(); // No pointer movement: panel must appear/clear on its own.
       if (stats_visible != expanded) {
-        std::cerr << "Network status button did not toggle the panel; dock_right="
+        std::cerr << "Network status tile did not toggle the panel; dock_right="
                   << dock_right << '\n';
         return 1;
       }
-      for (int y : {65, 195}) {
-        const auto pixel = adapter.pixels[(int(top) + y) * 1280 + control_x + 4];
-        const bool painted = pixel.r >= 240 && pixel.g >= 240 && pixel.b >= 240;
+      const int stats_x = int(stream->get_stats_card_x());
+      const int stats_y = int(stream->get_stats_card_y());
+      for (int y : {stats_y + 25, stats_y + 180}) {
+        const auto pixel = adapter.pixels[(int(top) + y) * 1280 + stats_x + 4];
+        const bool painted = is_dark_surface(pixel);
         const bool cleared = pixel.r == 0 && pixel.g == 0 && pixel.b == 0;
         if (expanded ? !painted : !cleared) {
           std::cerr << "Stats must fully " << (expanded ? "expand" : "collapse")
@@ -117,11 +131,18 @@ int main() {
                     << int(pixel.g) << ',' << int(pixel.b) << '\n';
           return 1;
         }
-        if (stream->invoke_is_local_control_area(control_x + 4, y) != expanded) {
+        if (stream->invoke_is_local_control_area(stats_x + 4, y) != expanded) {
           std::cerr << "Stats input area must match the rendered panel\n";
           return 1;
         }
       }
+    }
+    // Collapse Control Center and confirm retained-buffer pixels clear cleanly.
+    click_pill();
+    const auto cleared_panel = adapter.pixels[(int(top) + panel_y + 30) * 1280 + panel_x + 4];
+    if (cleared_panel.r != 0 || cleared_panel.g != 0 || cleared_panel.b != 0) {
+      std::cerr << "Collapsing UU Control Center must clear panel pixels; dock_right=" << dock_right << '\n';
+      return 1;
     }
   }
   std::cout << "Stream stats retained-buffer rendering passed.\n";

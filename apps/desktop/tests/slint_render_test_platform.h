@@ -58,6 +58,10 @@ class RenderTestWindow : public slint::platform::WindowAdapter {
     const auto p = pixels.at(y * extent.width + x);
     return p.r >= 230 && p.g >= 230 && p.b >= 230;
   }
+  bool DarkSurface(int x, int y) const {
+    const auto p = pixels.at(y * extent.width + x);
+    return p.r >= 12 && p.r <= 80 && p.g >= 14 && p.g <= 90 && p.b >= 20 && p.b <= 110;
+  }
   bool Black(int x, int y) const {
     const auto p = pixels.at(y * extent.width + x);
     return p.r == 0 && p.g == 0 && p.b == 0;

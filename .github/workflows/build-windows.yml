@@ -110,6 +110,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           xmake r keyboard_state_wire_test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy slint_stream_render_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake r slint_stream_render_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy slint_popup_render_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake r slint_popup_render_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy slint_ui_smoke_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SLINT_BACKEND = "winit-software"
+          xmake r slint_ui_smoke_test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item Env:SLINT_BACKEND -ErrorAction SilentlyContinue
           xmake b -vy crossdesk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

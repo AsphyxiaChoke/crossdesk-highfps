@@ -332,6 +332,21 @@ inline int ApplyStreamWindowStrings(
       Text(localization::transport_encryption_enabled[language]));
   strings.set_stats_encryption_disabled(
       Text(localization::transport_encryption_disabled[language]));
+  const auto tr3 = [&](const char* zh_cn, const char* zh_hant,
+                       const char* en) {
+    return Text(language == 0 ? zh_cn : language == 3 ? zh_hant : en);
+  };
+  strings.set_uu_control_center(tr3("控制中心", "控制中心", "Control Center"));
+  strings.set_uu_display_section(tr3("屏幕切换", "螢幕切換", "Displays"));
+  strings.set_uu_mouse_on(tr3("键鼠控制", "鍵鼠控制", "Mouse On"));
+  strings.set_uu_mouse_off(tr3("释放鼠标", "釋放滑鼠", "Mouse Off"));
+  strings.set_uu_audio_on(tr3("远端声音", "遠端聲音", "Audio On"));
+  strings.set_uu_audio_off(tr3("远端静音", "遠端靜音", "Muted"));
+  strings.set_uu_file_transfer(tr3("文件传输", "檔案傳輸", "Files"));
+  strings.set_uu_lock_screen(tr3("锁定桌面", "鎖定桌面", "Lock Win+L"));
+  strings.set_uu_net_stats(tr3("网络详情", "網路詳情", "Net Stats"));
+  strings.set_uu_latency_short(tr3("延迟", "延遲", "Ping"));
+  strings.set_uu_loss_short(tr3("丢包", "丟包", "Loss"));
   return language;
 }
 

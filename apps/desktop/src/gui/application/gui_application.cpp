@@ -4241,8 +4241,10 @@ void GuiApplication::SyncStreamWindow(StreamView& view) {
   stream->set_stats_remote_endpoint(UiText(direct ? net.remote_endpoint : ""));
 
   const auto fps_now = std::chrono::steady_clock::now();
+  const bool connected =
+      status == MiniRtcConnectionStatus::MiniRtcConnectionConnected;
   bool refresh_stats = false;
-  if (!props->net_traffic_stats_button_pressed_) {
+  if (!connected) {
     props->fps_ = 0;
     props->frame_count_ = 0;
     props->last_time_ = {};
@@ -4261,8 +4263,7 @@ void GuiApplication::SyncStreamWindow(StreamView& view) {
     }
   }
   stream->set_stats_fps(UiText(std::to_string(props->fps_)));
-  if (!props->net_traffic_stats_button_pressed_ ||
-      status != MiniRtcConnectionStatus::MiniRtcConnectionConnected) {
+  if (!connected) {
     props->video_latency_snapshot_.reset();
   } else if (refresh_stats) {
     props->video_latency_snapshot_ = props->video_latency_->Get(fps_now);
@@ -4274,9 +4275,7 @@ void GuiApplication::SyncStreamWindow(StreamView& view) {
                         " ms"
                   : "—"));
   const auto display_rtt = props->net_traffic_stats_.SmoothedRttMs(fps_now);
-  const bool rtt_available = props->net_traffic_stats_button_pressed_ &&
-                            status == MiniRtcConnectionStatus::MiniRtcConnectionConnected &&
-                            display_rtt.has_value();
+  const bool rtt_available = connected && display_rtt.has_value();
   std::string connection_latency = "—";
   if (rtt_available) {
     connection_latency =
@@ -4285,7 +4284,18 @@ void GuiApplication::SyncStreamWindow(StreamView& view) {
             : std::to_string(static_cast<int>(std::lround(*display_rtt))) + " ms";
   }
   stream->set_stats_connection_latency(UiText(connection_latency));
-  if (refresh_stats && status == MiniRtcConnectionStatus::MiniRtcConnectionConnected) {
+  int latency_ms = -1;
+  if (connected) {
+    if (display_rtt.has_value()) {
+      latency_ms = std::max(0, static_cast<int>(std::lround(*display_rtt)));
+    } else if (latency.has_value()) {
+      latency_ms = std::max(0, static_cast<int>(std::lround(latency->average_ms)));
+    }
+  }
+  stream->set_stats_latency_ms(latency_ms);
+  stream->set_stats_loss_summary(UiText(
+      connected ? FormatLossRate(net.video_inbound_stats.loss_rate) : "0%"));
+  if (props->net_traffic_stats_button_pressed_ && refresh_stats && connected) {
     LOG_DEBUG("Latency stats: remote={} video_ms={} video_samples={} video_endpoint={} "
               "rtt_raw_ms={} rtt_display_ms={}",
               props->remote_id_, latency ? latency->average_ms : -1,

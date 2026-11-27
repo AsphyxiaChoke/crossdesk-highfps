@@ -77,43 +77,56 @@ bool VerifyStreamPopups(RenderTestPlatform& platform) {
     if (close_synchronously) stream->set_file_transfer_visible(false);
   });
   screen.Settle();
-  // New sessions start with only the logo. Reveal the toolbar through its
-  // normal gesture before testing the buttons to the right of the logo.
-  screen.Click(19, top + 19);
-  constexpr int display_x = 43, shortcut_x = 75, file_x = 203, video_x = 235;
+  const auto click_pill = [&] {
+    screen.Click(stream->get_control_pill_x() + stream->get_control_pill_width() / 2,
+                 top + stream->get_control_pill_y() + stream->get_control_pill_height() / 2);
+  };
+  const int panel_x = int(stream->get_control_panel_x());
+  const int panel_y = int(stream->get_control_panel_y_pos());
+  const int probe_x = panel_x + 4;
+  const int probe_y = top + panel_y + 80;
   for (int repeat = 0; repeat < 2; ++repeat) {
-    screen.Click(display_x + 14, top + 19);
-    if (!Check(screen.Light(display_x + 5, top + 128), "Display menu must fully open without pointer movement")) return false;
-    screen.Click(display_x + 53, top + 94, 4);
-    if (!Check(selected_display == 1 && screen.Black(display_x + 5, top + 128),
-               "Display selection must survive live refresh and close the menu")) return false;
-    screen.Click(shortcut_x + 14, top + 19);
-    if (!Check(screen.Light(shortcut_x + 5, top + 102), "Shortcut menu must open without pointer movement")) return false;
-    screen.Click(shortcut_x + 31, top + 94, 4);
-    if (!Check(shortcut == "Win+L" && screen.Black(shortcut_x + 5, top + 102),
-               "Shortcut selection must close the menu immediately")) return false;
-    screen.Click(video_x + 14, top + 19);
-    if (!Check(stream->get_video_menu_open() && screen.Light(video_x + 4, top + 210),
-               "Video settings menu must fully open without pointer movement")) return false;
-    screen.Click(video_x + 41, top + 80, 4);
-    screen.Click(900, top + 300);
-    if (!Check(!stream->get_video_menu_open() && video_changes == repeat + 1,
-               "Video selection and outside dismissal must respond immediately")) return false;
+    click_pill();
+    if (!Check(stream->get_video_menu_open() && screen.DarkSurface(probe_x, probe_y),
+               "UU Control Center must open as a dark surface without pointer movement")) return false;
+    // Click Display 2 pill inside UU Control Center.
+    screen.Click(panel_x + 180, top + panel_y + 80, 4);
+    if (!Check(selected_display == 1 && stream->get_video_menu_open(),
+               "Display selection must survive live refresh inside UU Control Center")) return false;
+    // Click Low video quality segment pill.
+    screen.Click(panel_x + 60, top + panel_y + 143, 4);
+    if (!Check(video_changes == repeat + 1,
+               "Video quality selection must dispatch immediately")) return false;
+    // Click Win+L tile (row 2, col 2) which sends shortcut and closes Control Center.
+    const int grid_y = int(stream->get_quick_grid_y());
+    screen.Click(panel_x + 223, top + grid_y + 81, 4);
+    if (!Check(shortcut == "Win+L" && !stream->get_video_menu_open() && screen.Black(probe_x, probe_y),
+               "Shortcut selection must close the Control Center immediately")) return false;
   }
+  // Verify clicking outside Control Center closes it without forwarding clicks to the peer.
+  click_pill();
+  if (!Check(stream->get_video_menu_open() && screen.DarkSurface(probe_x, probe_y),
+             "UU Control Center must reopen on pill click")) return false;
+  screen.Click(900, top + 300);
+  if (!Check(!stream->get_video_menu_open() && screen.Black(probe_x, probe_y),
+             "Outside dismissal must close the Control Center immediately")) return false;
   if (!Check(remote_presses == 0 && remote_releases == 0 && remote_scrolls == 0,
-             "Menu gestures must not be forwarded to the peer")) return false;
-  screen.Click(file_x + 14, top + 19);
-  const int panel_y = top + int(stream->get_video_area_height()) - 210;
-  if (!Check(file_visible && screen.Light(20, panel_y + 25),
-             "File progress must appear without pointer movement")) return false;
+             "Control Center gestures must not be forwarded to the peer")) return false;
+
+  // Open Control Center again and click File Transfer tile (row 2, col 0).
+  click_pill();
+  screen.Click(panel_x + 52, top + int(stream->get_quick_grid_y()) + 81, 4);
+  const int panel_top = top + int(stream->get_video_area_height()) - 210;
+  if (!Check(file_visible && !stream->get_video_menu_open() && screen.DarkSurface(22, panel_top + 25),
+             "File progress must appear in dark UU theme without pointer movement")) return false;
   // Header/padding is outside the list's own input handler.
-  screen.Click(25, panel_y + 20, 4);
+  screen.Click(25, panel_top + 20, 4);
   stream->window().dispatch_pointer_scroll_event(
-      slint::LogicalPosition({25, float(panel_y + 20)}), 0, -60);
+      slint::LogicalPosition({25, float(panel_top + 20)}), 0, -60);
   screen.Settle();
   if (!Check(remote_presses == 0 && remote_releases == 0 && remote_scrolls == 0,
              "File progress header and padding must consume input locally")) return false;
-  const slint::LogicalPosition panel_point({25, float(panel_y + 20)});
+  const slint::LogicalPosition panel_point({25, float(panel_top + 20)});
   const slint::LogicalPosition outside({900, float(top + 300)});
   stream->window().dispatch_pointer_press_event(panel_point, slint::PointerEventButton::Left);
   screen.Settle(4);
@@ -122,15 +135,16 @@ bool VerifyStreamPopups(RenderTestPlatform& platform) {
   screen.Settle();
   if (!Check(remote_presses == 0 && remote_releases == 0,
              "Dragging out of the file panel must not release a button on the peer")) return false;
-  screen.Click(430, panel_y + 16, 4);
-  if (!Check(!file_visible && screen.Black(20, panel_y + 25),
+  screen.Click(430, panel_top + 16, 4);
+  if (!Check(!file_visible && screen.Black(22, panel_top + 25),
              "File progress close must clear its pixels without pointer movement")) return false;
   if (!Check(remote_presses == 0 && remote_releases == 0,
              "Closing file progress must not send an orphan pointer release")) return false;
   close_synchronously = true;
-  screen.Click(file_x + 14, top + 19);
-  screen.Click(430, panel_y + 16, 4);
-  if (!Check(!file_visible && screen.Black(20, panel_y + 25) && remote_releases == 0,
+  click_pill();
+  screen.Click(panel_x + 52, top + int(stream->get_quick_grid_y()) + 81, 4);
+  screen.Click(430, panel_top + 16, 4);
+  if (!Check(!file_visible && screen.Black(22, panel_top + 25) && remote_releases == 0,
              "Synchronous file panel dismissal must consume its closing release")) return false;
   screen.Click(900, top + 300);
   return Check(remote_presses == 1 && remote_releases == 1,

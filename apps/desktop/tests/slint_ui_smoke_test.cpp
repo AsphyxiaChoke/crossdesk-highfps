@@ -854,29 +854,34 @@ bool VerifySystemShortcutMenu() {
     stream->window().dispatch_pointer_press_event(point, slint::PointerEventButton::Left);
     stream->window().dispatch_pointer_release_event(point, slint::PointerEventButton::Left);
   };
-  // The toolbar starts collapsed. Reveal it before targeting its buttons.
-  click(19, 19);
-  settle();
+  const auto click_pill = [&] {
+    click(stream->get_control_pill_x() + stream->get_control_pill_width() / 2,
+          stream->get_control_pill_y() + stream->get_control_pill_height() / 2);
+    settle();
+  };
+  // Open the UU Control Center via the floating capsule before targeting tiles.
+  click_pill();
   stream->set_secure_attention_supported(true);
   settle();
-  click(90, 19);
-  if (!stream->invoke_is_local_control_area(90, 90)) return false;
-  click(90, 68);
+  const float panel_x = stream->get_control_panel_x();
+  const float grid_y = stream->get_quick_grid_y();
+  if (!stream->invoke_is_local_control_area(panel_x + 137, grid_y + 81)) return false;
+  click(panel_x + 137, grid_y + 81);
+  settle();
 
-  // Switching away from a Windows host hides the entire shortcut entry and
-  // closes an open menu; its former rows must no longer dispatch commands.
-  click(90, 19);
-  if (!stream->invoke_is_local_control_area(90, 90)) return false;
+  // Reopen Control Center, switch to a non-Windows host, and verify disabled
+  // shortcut tiles keep local hit testing without dispatching shortcuts.
+  click_pill();
+  if (!stream->invoke_is_local_control_area(panel_x + 223, grid_y + 81)) return false;
   stream->set_secure_attention_supported(false);
   settle();
-  if (stream->invoke_is_local_control_area(90, 90)) return false;
-  click(90, 98);
+  if (!stream->invoke_is_local_control_area(panel_x + 223, grid_y + 81)) return false;
+  click(panel_x + 223, grid_y + 81);
   if (commands != std::vector<std::string>{"Ctrl+Alt+Del"}) return false;
 
   stream->set_secure_attention_supported(true);
   settle();
-  click(90, 19);
-  click(90, 98);
+  click(panel_x + 223, grid_y + 81);
   return commands == std::vector<std::string>{"Ctrl+Alt+Del", "Win+L"};
 }
 
